@@ -5,11 +5,15 @@ module top_accelerator (
     input  logic       rst,       
     input  logic       ready_in,  
     
-    output logic [7:0] final_pixel_out,
+
+    output logic       final_serial_out,
     output logic       final_valid_out
 );
-
-    logic clk_100, clk_200;
+    
+    logic [7:0] pool_data_out;
+    logic       pool_valid_out;
+    logic       serial_ready_out;
+    logic       clk_100, clk_200;
     
     clk_wiz_0 clk_gen (
         .clk_in1  (sys_clk),
@@ -17,13 +21,11 @@ module top_accelerator (
         .clk_out2 (clk_200)
     );
 
-
     logic [12:0] bram_addr;
     logic        bram_rd_en;
     logic [7:0]  bram_dout;
     logic        bram_valid;
     logic        fifo_full;
-
 
     always_ff @(posedge clk_100) begin
         if (rst) begin
@@ -45,7 +47,6 @@ module top_accelerator (
         .valid_out (bram_valid)
     );
 
-
     logic [7:0] fifo_dout;
     logic       fifo_empty;
     logic       fifo_rd_en;
@@ -63,15 +64,12 @@ module top_accelerator (
         .empty  (fifo_empty)
     );
 
-
     assign fifo_rd_en = ~fifo_empty;
-
 
     always_ff @(posedge clk_200) begin
         if (rst) fifo_data_valid <= 1'b0;
         else     fifo_data_valid <= fifo_rd_en;
     end
-
 
     logic [7:0] p11, p12, p13, p21, p22, p23, p31, p32, p33;
     logic       win_valid;
@@ -105,9 +103,21 @@ module top_accelerator (
         .rst       (rst),
         .pixel_in  (sobel_pixel),
         .valid_in  (sobel_valid),
-        .ready_in  (ready_in),
-        .pixel_out (final_pixel_out),
-        .valid_out (final_valid_out)
+        .ready_in  (serial_ready_out),
+        .pixel_out (pool_data_out),
+        .valid_out (pool_valid_out)
+    );
+    
+    serializer u_serializer (
+        .clk           (clk_200),
+        .rst           (rst),              
+        .parallel_data (pool_data_out),
+        .valid_in      (pool_valid_out),
+        .ready_out     (serial_ready_out), 
+       
+        .serial_out    (final_serial_out), 
+        .valid_out     (final_valid_out),
+        .ready_in      (ready_in)          
     );
 
 endmodule
