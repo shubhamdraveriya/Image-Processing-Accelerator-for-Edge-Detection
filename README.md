@@ -11,6 +11,8 @@ Progress so far:
 - **Phase 2:** a hyperspectral pushbroom front end (`rtl/hs/`).
 - **Phase 3:** a CCSDS 123.0-B-2 lossless compressor (`rtl/ccsds123/`),
   byte-exact against an independent reference implementation.
+- **Phase 4:** radiation-tolerance features (`rtl/rel/`): SECDED-protected
+  memories, triplicated control registers and fault-injection tests.
 
 ## Pipeline
 
@@ -121,8 +123,53 @@ configurations. All 11 are identical byte for byte. The chain is
 RTL = `ccsds123.py` = NTNU model.
 
 **Resources** (Yosys, default build: 64 x 64 pixels, 16 bands, D = 16, P = 3,
-full prediction): about 6,000 LUTs, 3,000 flip-flops, 7 DSP48 and one
-RAMB18 on UltraScale+, a few percent of the ZCU106's XCZU7EV.
+full prediction): about 6,500 LUTs, 3,100 flip-flops, 7 DSP48 and one
+RAMB18 on UltraScale+, under 3% of the ZCU106's XCZU7EV.
+
+## Reliability for space (`rtl/rel/`)
+
+In orbit, heavy ions and protons flip bits (single-event upsets, SEUs) in
+flip-flops, block RAM and the FPGA's configuration memory. The compressor
+has a flight build (`ECC = 1`, `TMR = 1` on `ccsds123_top`) that protects
+its own state:
+
+| Block | What it does |
+|---|---|
+| `secded_enc` / `secded_dec` | Extended Hamming SECDED code for any data width: corrects any single-bit error, detects any double-bit error. 64 data bits give the classic (72,64) code |
+| `ecc_sdp_ram` / `ecc_lb_ram_rf` | Drop-in replacements for the RAMs, with SECDED per slice (per weight, for the predictor weights), error flags and an error-injection input |
+| `tmr_reg` | Triplicated register with a majority voter that re-converges every clock, so an upset never reaches the output; reports outvoted upsets |
+
+In the flight build every state memory of the compressor (line buffer, band
+state, weights, accumulators) is ECC-protected and the position counters and
+the coder's counter are triplicated. These memories are rewritten every
+pixel or line, so a corrected upset is also flushed out and they need no
+background scrubber. `ccsds123_top` counts corrected and uncorrectable memory
+errors and outvoted register upsets for telemetry.
+
+The protection is cheap: on UltraScale (Yosys, default image size) the
+flight build is about 7,300 LUTs, 3,300 flip-flops, 7 DSP48 and one RAMB36,
+against 6,450 LUTs, 3,100 flip-flops and one RAMB18 without it.
+
+Fault-injection tests (`tb/tb_ccsds123.sv`, `FAULT` parameter) inject upsets
+into live state while images stream through:
+
+| Test | Result |
+|---|---|
+| Single-bit memory upsets, flight build | Output byte-exact; every upset counted as corrected |
+| Upsets in one copy of every TMR register | Output byte-exact; upsets counted as outvoted |
+| The same memory upsets without ECC (control) | Output corrupted, which shows the injection hits state that matters |
+| Double-bit memory upsets | Detected and counted as uncorrectable |
+
+What this does not cover, and a flight design still needs:
+- **Configuration memory scrubbing.** On AMD parts this is the Soft Error
+  Mitigation (SEM) IP, or the XQRKU060's and Versal's built-in scrubbing. It
+  is vendor IP configured in Vivado, so it is not in this repo.
+- **Full TMR of the datapath.** Only the control state is triplicated here.
+  Flight teams usually triplicate the whole netlist with a TMR tool, or rely
+  on per-image error detection, as this design does through its error
+  counters.
+- **DDR ECC and single-event latch-up protection.** These are board and
+  processing-system level.
 
 ## Fixes against the original design
 
@@ -170,13 +217,16 @@ Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), `git`, Python 3 with
   stalls), R = 32 with mod-R wrap-around, weight clipping, escape codes,
   counter rescaling, several images back to back and header on or off.
   Deliberately injected bugs (13 different ones) all make the regression fail.
+- `tb/tb_secded.sv` checks the SECDED code on every single-bit and
+  double-bit error pattern for nine data widths from 1 to 64 bits. The
+  fault-injection cases (`rel_seu_*`) are described under Reliability.
 - `make ntnu-check` compares `model/ccsds123.py` with the NTNU reference model
   (needs `bitarray` and `psutil`).
 - `scripts/regress.py` lists the cases: 8/10/12/16-bit, minimum sizes,
   odd sizes, full rate and heavy stalls. CI (`.github/workflows/ci.yml`) runs
   everything on every push.
-- `scripts/yosys/synth_check.sh` synthesises `edge_accel_top`, `hs_frontend`
-  and `ccsds123_top` with Yosys
+- `scripts/yosys/synth_check.sh` synthesises `edge_accel_top`, `hs_frontend`,
+  `ccsds123_top` and its flight build (ECC and TMR on) with Yosys
   for the 7-series, UltraScale and UltraScale+ cell libraries. It fails on
   latches, netlist check errors or any SRL (the flight build bans SRLs),
   and prints the cell counts. That proves the RTL is synthesisable and maps
@@ -220,4 +270,4 @@ a few LUTRAMs (FIFO and pooling buffers).
 3. **Done:** CCSDS 123.0-B-2 lossless compressor, byte-exact against an independent reference.
 4. PS/PL integration: CCSDS Space Packets over Ethernet to a PC ground station.
 5. Strip-parallel compressors at Pixxel-like line rates.
-6. Space-grade build: TMR, BRAM ECC, SEM scrubbing with fault injection, XQRKU060 reports.
+6. **Done (in the RTL):** a space-grade build with TMR, memory ECC and fault-injection tests. Still to do: SEM scrubbing and XQRKU060 reports in Vivado.

@@ -5,7 +5,7 @@
 PY  ?= python3
 RTL := rtl/common/*.sv rtl/edge/*.sv rtl/top/*.sv
 HS  := rtl/common/*.sv rtl/hs/*.sv
-CC  := rtl/common/*.sv rtl/ccsds123/*.sv
+CC  := rtl/common/*.sv rtl/rel/*.sv rtl/ccsds123/*.sv
 
 # independent CCSDS 123.0-B-2 reference (NTNU SmallSat Lab, MIT licence)
 NTNU_URL    := https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model.git
@@ -36,6 +36,7 @@ lint:
 	verilator --lint-only -Wall --top-module edge_accel_top $(RTL)
 	verilator --lint-only -Wall --top-module hs_frontend    $(HS)
 	verilator --lint-only -Wall --top-module ccsds123_top   $(CC)
+	verilator --lint-only -Wall --top-module ccsds123_top   $(CC) -GECC=1\'b1 -GTMR=1\'b1
 	verilator --lint-only -Wall -Wno-DECLFILENAME --top-module basys3_top lint/waivers.vlt \
 		$(RTL) rtl/board/basys3_top.sv ip/clk_wiz_0/clk_wiz_0_stub.v
 
