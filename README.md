@@ -9,6 +9,8 @@ Progress so far:
 - **Phase 1:** the original Basys 3 design, cleaned up into a parameterised,
   AXI4-Stream, fully verified core.
 - **Phase 2:** a hyperspectral pushbroom front end (`rtl/hs/`).
+- **Phase 3:** a CCSDS 123.0-B-2 lossless compressor (`rtl/ccsds123/`),
+  byte-exact against an independent reference implementation.
 
 ## Pipeline
 
@@ -79,6 +81,49 @@ plus dark offsets, gain spread, dead columns and saturating samples.
 `tb/tb_hs_frontend.sv` programs the design over AXI4-Lite, streams the cube
 with random stalls, checks every sample, then reads the counters back.
 
+## CCSDS 123.0-B-2 lossless compressor (`rtl/ccsds123/`)
+
+CCSDS 123.0-B-2 is the space agencies' standard for compressing
+multispectral and hyperspectral images onboard. It predicts each sample from
+its spatial neighbours and the previous bands with weights that adapt as the
+image streams through, then entropy-codes the prediction residuals.
+
+```
+s_axis ─▶ predictor ─▶ slice ─▶ entropy coder ─▶ header insert ─▶ packer ─▶ m_axis
+ D-bit    9 stages,             Sigma/Gamma,      19-byte CCSDS    64-bit words,
+ BIP      1 sample/clk          k, codewords      header per image  tkeep, tlast
+```
+
+| Block | What it does |
+|---|---|
+| `ccsds123_predictor` | Local sums, local differences, weighted prediction, mod-R scaling, residual mapping and sign-algorithm weight update (sections 4.4 to 4.10 of the standard). Line buffer in block RAM, per-band weights and state in small RAMs |
+| `ccsds123_coder` | Sample-adaptive entropy coder (5.4.3.2): per-band accumulator, shared counter with rescaling, code parameter k, unary/binary codewords and escape codes |
+| `ccsds123_packer` | Packs codewords into a 64-bit AXI4-Stream byte stream (lane 0 first), pads each image to a whole byte, `tkeep` and `tlast` on the last word |
+| `ccsds123_top` | Chains them and, with `EMIT_HEADER = 1`, starts each image with the standard header built from the parameters, so every image is a complete file any compliant decoder reads |
+
+**Configuration.** Lossless, unsigned samples, D = 2..16 bits, full or
+reduced prediction, P = 0..15 previous bands, wide neighbour- or
+column-oriented local sums, all weight and coder parameters of the standard,
+band-interleaved-by-pixel order (as a pushbroom sensor reads out), output
+word size 1 byte. The parameters are fixed at build time and recorded in the
+header.
+
+**Throughput.** One sample per clock when the image has 9 or more bands. The
+per-band weight update has `NZ` clocks to finish because the same band only
+comes back one pixel later; with fewer bands the input stalls until it has.
+
+**Reference model.** `model/ccsds123.py` is a compressor and decompressor
+written from the standard. `make ntnu-check` clones the independent
+[NTNU SmallSat Lab model](https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model)
+(verified by its authors against the official CCSDS test vectors) at a pinned
+commit and compares the complete compressed files of both models on 11
+configurations. All 11 are identical byte for byte. The chain is
+RTL = `ccsds123.py` = NTNU model.
+
+**Resources** (Yosys, default build: 64 x 64 pixels, 16 bands, D = 16, P = 3,
+full prediction): about 6,000 LUTs, 3,000 flip-flops, 7 DSP48 and one
+RAMB18 on UltraScale+, a few percent of the ZCU106's XCZU7EV.
+
 ## Fixes against the original design
 
 | Original problem | Now |
@@ -97,13 +142,13 @@ with random stalls, checks every sample, then reads the counters back.
 All verification is board-free and runs in CI on every push:
 
 ```
-make test            # golden model tests + Verilator lint + Icarus regression + Yosys synthesis
+make test            # model tests + NTNU cross-check + Verilator lint + Icarus regression + Yosys synthesis
 make sim-verilator   # the same regression compiled with Verilator
 make synth           # Yosys synthesis only
 ```
 
-Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), Python 3 with
-`numpy` and `pytest`.
+Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), `git`, Python 3 with
+`numpy`, `pytest`, `bitarray` and `psutil` (the last two for the NTNU model).
 
 - `model/edge_golden.py` is the bit-exact reference: what the RTL must
   produce. `model/test_edge_golden.py` checks it against a direct
@@ -117,10 +162,21 @@ Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), Python 3 with
   the output pins and checks every pixel.
 - `tb/tb_hs_frontend.sv` covers the hyperspectral front end, including
   AXI4-Lite programming, line pacing and overrun detection.
+- `tb/tb_ccsds123.sv` streams images through `ccsds123_top` with random
+  stalls and checks every mapped residual leaving the predictor, every output
+  byte against `model/ccsds123.py`, `tkeep`, `tlast` and stability under
+  backpressure. The 13 cases cover D = 2, 8, 10, 12, 14 and 16, P = 0 to 15,
+  full and reduced prediction, both local sums, Nx = 1, Nz = 1 and 3 (hazard
+  stalls), R = 32 with mod-R wrap-around, weight clipping, escape codes,
+  counter rescaling, several images back to back and header on or off.
+  Deliberately injected bugs (13 different ones) all make the regression fail.
+- `make ntnu-check` compares `model/ccsds123.py` with the NTNU reference model
+  (needs `bitarray` and `psutil`).
 - `scripts/regress.py` lists the cases: 8/10/12/16-bit, minimum sizes,
   odd sizes, full rate and heavy stalls. CI (`.github/workflows/ci.yml`) runs
   everything on every push.
-- `scripts/yosys/synth_check.sh` synthesises `edge_accel_top` with Yosys
+- `scripts/yosys/synth_check.sh` synthesises `edge_accel_top`, `hs_frontend`
+  and `ccsds123_top` with Yosys
   for the 7-series, UltraScale and UltraScale+ cell libraries. It fails on
   latches, netlist check errors or any SRL (the flight build bans SRLs),
   and prints the cell counts. That proves the RTL is synthesisable and maps
@@ -149,6 +205,7 @@ serial data/valid/last bit, LD0 = valid, LD14 = framing error, LD15 = source don
 |---|---|
 | RTL behaviour | Verified in simulation against the golden model (Icarus and Verilator) |
 | Synthesisability | Checked with Yosys for 7-series, UltraScale and UltraScale+ |
+| CCSDS 123 conformance | Byte-exact with the NTNU reference model on 11 configurations; not run against the official CCSDS test vectors themselves |
 | Vivado timing, utilisation, CDC | **Not run.** The `Report/` PNGs are from the original design |
 | `constraints/basys3.xdc`, `rtl/board/basys3_top.sv`, `scripts/vivado/*.tcl` | **Unverified scaffolding**, never run through Vivado or on a board |
 
@@ -158,9 +215,9 @@ a few LUTRAMs (FIFO and pooling buffers).
 
 ## Roadmap
 
-1. **Phase 1 (this):** production-grade streaming core, golden model, CI.
-2. Hyperspectral front end on ZCU106: DDR line replay, dark/gain correction, bad pixels, band selection.
-3. CCSDS 123.0-B-2 lossless compressor, bit-exact against software.
+1. **Done:** production-grade streaming core, golden model, CI.
+2. **Done:** hyperspectral front end: line pacing, dark/gain correction, bad pixels, band selection.
+3. **Done:** CCSDS 123.0-B-2 lossless compressor, byte-exact against an independent reference.
 4. PS/PL integration: CCSDS Space Packets over Ethernet to a PC ground station.
 5. Strip-parallel compressors at Pixxel-like line rates.
 6. Space-grade build: TMR, BRAM ECC, SEM scrubbing with fault injection, XQRKU060 reports.
