@@ -31,15 +31,15 @@ module axis_async_fifo #(
 );
     localparam int AW = $clog2(DEPTH);
 
-    // synthesis translate_off
+    `ifndef SYNTHESIS
     initial begin
         if (DEPTH < 4 || (1 << AW) != DEPTH)
             $fatal(1, "axis_async_fifo: DEPTH (%0d) must be a power of two >= 4", DEPTH);
     end
-    // synthesis translate_on
+    `endif
 
-    function automatic logic [AW:0] bin2gray(input logic [AW:0] b);
-        return b ^ (b >> 1);
+    function automatic [AW:0] bin2gray(input [AW:0] b);
+        bin2gray = b ^ (b >> 1);
     endfunction
 
     // ---------------- write domain ----------------

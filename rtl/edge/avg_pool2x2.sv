@@ -37,12 +37,12 @@ module avg_pool2x2 #(
     localparam int RW    = (IN_H > 1) ? $clog2(IN_H) : 1;
     localparam int IW    = (OUT_W > 1) ? $clog2(OUT_W) : 1;
 
-    // synthesis translate_off
+    `ifndef SYNTHESIS
     initial begin
         if (IN_W < 2 || IN_H < 2 || (IN_W % 2) != 0 || (IN_H % 2) != 0)
             $fatal(1, "avg_pool2x2: IN_W (%0d) and IN_H (%0d) must be even and >= 2", IN_W, IN_H);
     end
-    // synthesis translate_on
+    `endif
 
     logic ce, fire;
     assign ce            = !m_axis_tvalid || m_axis_tready;

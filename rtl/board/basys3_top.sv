@@ -1,4 +1,5 @@
 `timescale 1ns / 1ps
+// UNVERIFIED SCAFFOLDING: lint-checked only; never built in Vivado or run on a board.
 // -----------------------------------------------------------------------------
 // basys3_top: Basys 3 (XC7A35T) wrapper. The only board-specific RTL:
 // it instantiates the clk_wiz_0 IP (100 MHz in -> 100 MHz + 200 MHz out) and

@@ -45,11 +45,11 @@ module sobel_core #(
     localparam int RW   = $clog2(IMG_H);
     localparam int MAXV = (1 << DW) - 1;
 
-    // synthesis translate_off
+    `ifndef SYNTHESIS
     initial begin
         if (IMG_W < 3 || IMG_H < 3) $fatal(1, "sobel_core: image must be at least 3x3");
     end
-    // synthesis translate_on
+    `endif
 
     // ---------------------------------------------------------------------
     // Pipeline enable: everything advances together when the output register
@@ -133,7 +133,8 @@ module sobel_core #(
     // ---------------------------------------------------------------------
     // Stage B: shift the 3x3 window (w[row][col], row 0 = top).
     // ---------------------------------------------------------------------
-    logic [DW-1:0] w00, w01, w02, w10, w11, w12, w20, w21, w22;
+    // shreg_extract: keep the window in flip-flops, never SRLs (see above).
+    (* shreg_extract = "no" *) logic [DW-1:0] w00, w01, w02, w10, w11, w12, w20, w21, w22;
     logic          b_v, b_user, b_last;
 
     always_ff @(posedge clk) begin
@@ -162,8 +163,8 @@ module sobel_core #(
     logic signed [DW+1:0] d1x, d2x, d3x, d1y, d2y, d3y;
     logic                 c_v, c_user, c_last;
 
-    function automatic logic signed [DW+1:0] sx(input logic [DW-1:0] v);
-        return $signed({2'b00, v});
+    function automatic signed [DW+1:0] sx(input [DW-1:0] v);
+        sx = $signed({2'b00, v});
     endfunction
 
     // ---------------------------------------------------------------------
@@ -174,11 +175,17 @@ module sobel_core #(
     logic        [DW+3:0] mag;
     logic                 e_v, e_user, e_last;
 
+    // Control bits are reset, which also keeps them out of SRLs (SRL contents
+    // cannot be corrected by configuration scrubbing in a flight build).
     always_ff @(posedge clk) begin
         if (rst) begin
             c_v <= 1'b0; d_v <= 1'b0; e_v <= 1'b0; m_axis_tvalid <= 1'b0;
+            c_user <= 1'b0; d_user <= 1'b0; e_user <= 1'b0; m_axis_tuser <= 1'b0;
+            c_last <= 1'b0; d_last <= 1'b0; e_last <= 1'b0; m_axis_tlast <= 1'b0;
         end else if (ce) begin
             c_v <= b_v; d_v <= c_v; e_v <= d_v; m_axis_tvalid <= e_v;
+            c_user <= b_user; d_user <= c_user; e_user <= d_user; m_axis_tuser <= e_user;
+            c_last <= b_last; d_last <= c_last; e_last <= d_last; m_axis_tlast <= e_last;
         end
     end
 
@@ -190,17 +197,13 @@ module sobel_core #(
             d1y <= sx(w00) - sx(w20);
             d2y <= sx(w01) - sx(w21);
             d3y <= sx(w02) - sx(w22);
-            c_user <= b_user; c_last <= b_last;
 
             gx <= (DW+4)'(d1x) + ((DW+4)'(d2x) <<< 1) + (DW+4)'(d3x);
             gy <= (DW+4)'(d1y) + ((DW+4)'(d2y) <<< 1) + (DW+4)'(d3y);
-            d_user <= c_user; d_last <= c_last;
 
             mag <= (gx[DW+3] ? -gx : gx) + (gy[DW+3] ? -gy : gy);
-            e_user <= d_user; e_last <= d_last;
 
             m_axis_tdata <= (mag > (DW+4)'(MAXV)) ? DW'(MAXV) : mag[DW-1:0];
-            m_axis_tuser <= e_user; m_axis_tlast <= e_last;
         end
     end
 endmodule

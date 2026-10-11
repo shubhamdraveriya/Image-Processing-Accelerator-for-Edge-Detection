@@ -10,10 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install simulators
+      - name: Install simulators and Yosys
         run: |
           sudo apt-get update
-          sudo apt-get install -y iverilog verilator
+          sudo apt-get install -y iverilog verilator yosys
 
       - uses: actions/setup-python@v5
         with:
@@ -34,9 +34,14 @@ jobs:
       - name: Regression (Verilator)
         run: make sim-verilator
 
+      - name: Synthesis check (Yosys, 7-series / UltraScale / UltraScale+)
+        run: make synth
+
       - name: Keep logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: regress-logs
-          path: build/regress/**/run.log
+          path: |
+            build/regress/**/run.log
+            build/yosys/*.log

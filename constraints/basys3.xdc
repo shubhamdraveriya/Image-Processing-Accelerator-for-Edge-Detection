@@ -1,3 +1,4 @@
+## UNVERIFIED SCAFFOLDING: not yet run through Vivado or tested on a board.
 ## Basys 3 (XC7A35T-1CPG236C) pin map for rtl/board/basys3_top.sv
 ## The 100 MHz input clock constraint comes from the clk_wiz_0 IP's own XDC
 ## (create_clock -period 10 on clk_in1), so it is not repeated here.

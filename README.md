@@ -59,14 +59,18 @@ critical path. No pixel is ever dropped, from the ROM to the serial pins.
 | Vendor FIFO Generator IP in the datapath | Portable `axis_async_fifo` |
 | Testbenches had to be checked by eye in the waveform | Self-checking testbenches against a Python golden model, in CI |
 
-## Verification
+## Verification (no board needed)
+
+All verification is board-free and runs in CI on every push:
 
 ```
-make test            # golden model tests + Verilator lint + Icarus regression
+make test            # golden model tests + Verilator lint + Icarus regression + Yosys synthesis
 make sim-verilator   # the same regression compiled with Verilator
+make synth           # Yosys synthesis only
 ```
 
-Needs `iverilog` (12+), `verilator` (5.x), Python 3 with `numpy` and `pytest`.
+Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), Python 3 with
+`numpy` and `pytest`.
 
 - `model/edge_golden.py` is the bit-exact reference: what the RTL must
   produce. `model/test_edge_golden.py` checks it against a direct
@@ -81,6 +85,11 @@ Needs `iverilog` (12+), `verilator` (5.x), Python 3 with `numpy` and `pytest`.
 - `scripts/regress.py` lists the 15 cases: 8/10/12/16-bit, minimum sizes,
   odd sizes, full rate and heavy stalls. CI (`.github/workflows/ci.yml`) runs
   everything on every push.
+- `scripts/yosys/synth_check.sh` synthesises `edge_accel_top` with Yosys
+  for the 7-series, UltraScale and UltraScale+ cell libraries. It fails on
+  latches, netlist check errors or any SRL (the flight build bans SRLs),
+  and prints the cell counts. That proves the RTL is synthesisable and maps
+  to block RAM as intended, but it is not Vivado timing closure.
 
 ## Building with Vivado
 
@@ -101,9 +110,16 @@ serial data/valid/last bit, LD0 = valid, LD14 = framing error, LD15 = source don
 
 ## Status of hardware results
 
-The timing, CDC and power PNGs in `Report/` are from the original design. The
-phase 1 RTL has been simulated and linted but **not yet run through Vivado**,
-so it has no new utilisation or timing numbers yet.
+| Item | Status |
+|---|---|
+| RTL behaviour | Verified in simulation against the golden model (Icarus and Verilator) |
+| Synthesisability | Checked with Yosys for 7-series, UltraScale and UltraScale+ |
+| Vivado timing, utilisation, CDC | **Not run.** The `Report/` PNGs are from the original design |
+| `constraints/basys3.xdc`, `rtl/board/basys3_top.sv`, `scripts/vivado/*.tcl` | **Unverified scaffolding**, never run through Vivado or on a board |
+
+Yosys cell counts for the whole demo (64x64, 8-bit) are about 340 LUTs,
+430 flip-flops, one RAMB36 (image ROM), one RAMB18 (Sobel line buffers) and
+a few LUTRAMs (FIFO and pooling buffers).
 
 ## Roadmap
 

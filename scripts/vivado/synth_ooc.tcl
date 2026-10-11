@@ -1,3 +1,4 @@
+# UNVERIFIED SCAFFOLDING: not yet run (no Vivado available).
 # Out-of-context synthesis + implementation of the vendor-neutral core for a
 # given part, to report utilisation and timing without a board.
 #

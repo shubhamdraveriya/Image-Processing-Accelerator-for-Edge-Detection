@@ -1,3 +1,4 @@
+# UNVERIFIED SCAFFOLDING: not yet run (no Vivado or board available).
 # Full Basys 3 build (non-project mode): synth, place, route, reports, bitstream.
 #   vivado -mode batch -source scripts/vivado/build_basys3.tcl
 # Outputs go to vivado_out/basys3/.
