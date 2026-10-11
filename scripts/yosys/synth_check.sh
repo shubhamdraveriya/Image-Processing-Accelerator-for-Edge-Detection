@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Board-free synthesis check with Yosys (no Vivado needed).
 #
-# Synthesises each top (edge_accel_top, hs_frontend) for 7-series (Basys 3), UltraScale (KU060 /
+# Synthesises each top (edge_accel_top, hs_frontend, ccsds123_top) for 7-series (Basys 3), UltraScale (KU060 /
 # XQRKU060) and UltraScale+ (ZCU106) cell libraries and fails if:
 #   - the RTL does not elaborate or synthesise,
 #   - the netlist has latches or other check problems,
 #   - any SRL primitive appears (banned in the flight build: configuration
-#     scrubbing cannot correct SRL contents).
+#     scrubbing cannot correct SRL contents). Yosys ignores the per-signal
+#     shreg_extract = "no" attributes that Vivado honours, so SRL inference is
+#     switched off globally (-nosrl), as a flight Vivado flow would do; the
+#     check still catches SRLs instantiated by hand.
 # Writes per-family logs and a cell summary to build/yosys/.
 #
 # This proves the RTL is synthesisable and maps to the expected primitives.
@@ -18,7 +21,7 @@ mkdir -p "$OUT"
 status=0
 
 # top : source directories (defaults of each top's parameters are used)
-TOPS="edge_accel_top:common,edge,top hs_frontend:common,hs"
+TOPS="${TOPS:-edge_accel_top:common,edge,top hs_frontend:common,hs ccsds123_top:common,ccsds123}"
 
 for entry in $TOPS; do
 top=${entry%%:*}
@@ -30,7 +33,7 @@ for fam in xc7 xcu xcup; do
     # Run from data/ so the ROM's $readmemh finds its image.
     if ! (cd "$ROOT/data" && yosys -q -l "$log" -p "
             read_verilog -sv -DSYNTHESIS $SRCS;
-            synth_xilinx -family $fam -top $top;
+            synth_xilinx -family $fam -top $top -nosrl;
             check -assert;
             select -assert-none t:SRL* t:\$dlatch t:\$_DLATCH_*;
             tee -o $OUT/$tag.stat stat" >/dev/null 2>&1); then

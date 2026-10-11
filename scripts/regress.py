@@ -24,6 +24,8 @@ RTL_CORE = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl"
 RTL_TOP = RTL_CORE + sorted((ROOT / "rtl" / "top").glob("*.sv"))
 RTL_HS = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "hs").glob("*.sv"))
 HS_GOLDEN = [sys.executable, str(ROOT / "model" / "hs_golden.py")]
+RTL_CCSDS = (sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "ccsds123").glob("*.sv")))
+CCSDS_MODEL = [sys.executable, str(ROOT / "model" / "ccsds123.py")]
 
 MODE = {"sobel": 0, "pool": 1, "pipeline": 2}
 
@@ -60,6 +62,30 @@ HS_CASES = [
     ("hs_12b_16x8_paced",          12,  16,  8, 6, 2,  200, 0, 100, 100, 5),
     ("hs_12b_16x8_overrun",        12,  16,  8, 6, 2,  130, 1, 100,  30, 6),
 ]
+
+# CCSDS 123 compressor: name, model/RTL settings (defaults: 16x8x10, D=12,
+# P=3, full, neighbour sums, Omega=13, R=64, v=-1..3, t_inc=2^6, U_max=18,
+# gamma*=6, gamma0=1, K=3, scene image, header on, 1 frame), valid %, ready %
+CCSDS_CASES = [
+    ("c123_default_stress",          dict(), 80, 70),
+    ("c123_full_rate_3_frames",      dict(frames=3, seed=2), 100, 100),
+    ("c123_d16_p15_omega19",         dict(nx=24, ny=6, nz=20, d=16, p=15, omega=19, k=14, seed=3), 90, 80),
+    ("c123_d8_reduced_column",       dict(nx=20, ny=10, nz=12, d=8, p=4, reduced=1, column=1, k=2, seed=4), 85, 60),
+    ("c123_full_column",             dict(nx=18, ny=7, nz=11, p=2, column=1, seed=5), 75, 75),
+    ("c123_nx1_reduced_column",      dict(nx=1, ny=40, nz=6, p=5, reduced=1, column=1, seed=6), 90, 90),
+    ("c123_nz3_hazard_stalls",       dict(nx=12, ny=6, nz=3, p=2, seed=7), 100, 100),
+    ("c123_nz1_p0",                  dict(nx=9, ny=9, nz=1, p=0, seed=8), 100, 90),
+    ("c123_random_r32_wide_v",       dict(nx=16, ny=8, nz=10, d=10, omega=16, r=32, vmin=-6, vmax=9, tinc=4,
+                                          image="random", seed=9), 80, 80),
+    ("c123_extremes_escapes",        dict(nx=14, ny=6, nz=9, d=16, p=6, umax=8, gstar=4, k=0, image="extremes",
+                                          seed=10), 70, 90),
+    ("c123_d2_minimum",              dict(nx=10, ny=6, nz=5, d=2, p=1, umax=8, gstar=11, g0=8, k=0,
+                                          image="random", seed=11), 90, 50),
+    ("c123_body_only_2_frames",      dict(frames=2, header=0, gstar=11, g0=5, seed=12), 85, 85),
+    ("c123_d14_64x16x32",            dict(nx=64, ny=16, nz=32, d=14, p=8, seed=13), 100, 100),
+]
+CCSDS_DEFAULT = dict(nx=16, ny=8, nz=10, d=12, p=3, reduced=0, column=0, omega=13, r=64, vmin=-1, vmax=3,
+                     tinc=6, umax=18, gstar=6, g0=1, k=3, image="scene", frames=1, seed=1, header=1)
 
 
 def run(cmd: list[str], log: Path) -> tuple[bool, str]:
@@ -161,6 +187,33 @@ def main() -> int:
             ok, out = build_and_run(args.sim, "tb_hs_frontend", RTL_HS + [ROOT / "tb" / "tb_hs_frontend.sv"],
                                     params, [f"+IN={vec}_in.hex", f"+EXP={vec}_exp.hex", f"+CFG={vec}_cfg.txt"],
                                     wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    for name, cfg, vp, rp in CCSDS_CASES:
+        if args.k not in name:
+            continue
+        c = {**CCSDS_DEFAULT, **cfg}
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        vec = wd / "vec"
+        t0 = time.time()
+        cmd = CCSDS_MODEL + ["vectors", "--out", str(vec)]
+        for k in ("nx", "ny", "nz", "d", "p", "omega", "r", "vmin", "vmax", "tinc", "umax", "gstar", "g0", "k",
+                  "image", "frames", "seed"):
+            cmd += [f"--{k}", str(c[k])]
+        cmd += [f"--{k}" for k in ("reduced", "column", "header") if c[k]]
+        ok, out = run(cmd, log)
+        if ok:
+            params = dict(NX=c["nx"], NY=c["ny"], NZ=c["nz"], D=c["d"], P=c["p"], FULL=0 if c["reduced"] else 1,
+                          LOCAL_SUM=2 if c["column"] else 0, OMEGA=c["omega"], R=c["r"], VMIN=c["vmin"],
+                          VMAX=c["vmax"], TINC_LOG2=c["tinc"], UMAX=c["umax"], GSTAR=c["gstar"], GAMMA0=c["g0"],
+                          KINIT=c["k"], EMIT_HEADER=c["header"], FRAMES=c["frames"], VALID_PCT=vp, READY_PCT=rp,
+                          SEED=c["seed"])
+            ok, out = build_and_run(args.sim, "tb_ccsds123", RTL_CCSDS + [ROOT / "tb" / "tb_ccsds123.sv"], params,
+                                    [f"+IN={vec}_in.hex", f"+DELTA={vec}_delta.hex", f"+EXP={vec}_exp.hex",
+                                     f"+META={vec}_meta.txt"], wd, log)
         results.append((name, ok and "PASS:" in out, time.time() - t0, log))
 
     if not results:
