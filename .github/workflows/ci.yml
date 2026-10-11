@@ -1,0 +1,47 @@
+name: rtl-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install simulators and Yosys
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog verilator yosys
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python packages
+        run: python -m pip install numpy pytest
+
+      - name: Golden model unit tests
+        run: make model-test
+
+      - name: Verilator lint
+        run: make lint
+
+      - name: Regression (Icarus Verilog)
+        run: make sim
+
+      - name: Regression (Verilator)
+        run: make sim-verilator
+
+      - name: Synthesis check (Yosys, 7-series / UltraScale / UltraScale+)
+        run: make synth
+
+      - name: Keep logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-logs
+          path: |
+            build/regress/**/run.log
+            build/yosys/*.log
