@@ -212,7 +212,8 @@ def main() -> int:
             ok, out = run(GOLDEN + ["expect", "--mode", "pipeline", "--w", "64", "--h", "64",
                                     "--frames", str(frames), "--mem", str(mem), "--out", str(wd / "top")], log)
         if ok:
-            params = dict(FRAMES=frames, INIT_FILE=f'"{mem}"' if args.sim == "icarus" else f'"{mem}"',
+            # forward slashes: a Windows backslash would be an escape inside the Verilog string
+            params = dict(FRAMES=frames, INIT_FILE=f'"{mem.as_posix()}"',
                           SRC_HALF=src_half, PROC_HALF=proc_half, READY_PCT=rp)
             ok, out = build_and_run(args.sim, "tb_edge_accel_top", RTL_TOP + [ROOT / "tb" / "tb_edge_accel_top.sv"],
                                     params, [f"+EXP={wd / 'top'}_exp.hex"], wd, log)

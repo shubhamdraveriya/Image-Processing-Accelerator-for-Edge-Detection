@@ -264,6 +264,37 @@ several compressors in parallel (by strips of the image) to reach the line
 rates of a wide-swath sensor. Yosys counts are an estimate; Vivado usually
 packs LUTs tighter.
 
+### Vivado results
+
+`scripts/vivado/synth_ooc.tcl`, Vivado 2018.2, out of context (no I/O
+placement, so the absolute slack is optimistic for the ports but the internal
+paths are real), routed:
+
+| Design | Part, clock | LUTs | FFs | DSP | Block RAM | WNS | Failing endpoints |
+|---|---|---|---|---|---|---|---|
+| `edge_pipeline` 64x64x8 | XCZU7EV-2, 250 MHz | 192 | 339 | 0 | 1 RAMB18 | met | 0 |
+| `payload_top` | XCZU7EV-2, 250 MHz | 3,726 | 4,309 | 9 | 1 RAMB36 + 6 RAMB18 | +0.158 ns | 0 |
+| `payload_top`, flight build | XCZU7EV-2, 250 MHz | 4,402 | 4,488 | 9 | 2 RAMB36 + 5 RAMB18 | -0.351 ns | 170 |
+| `payload_top`, flight build | XCKU060-2, 200 MHz | 4,396 | 4,488 | 9 | 2 RAMB36 + 5 RAMB18 | -1.052 ns | 571 |
+
+These runs predate the coder-to-packer register slice in `ccsds123_top`
+(below); they are the original RTL.
+
+Critical paths found:
+
+- **Coder to packer** (all builds; the worst path of the non-flight payload,
+  13 logic levels): codeword length in the coder's last stage, header mux and
+  the packer's 128-bit shift in one cycle. Fixed by a register slice
+  (`u_cw_slice`) between header insertion and the packer: one cycle of extra
+  latency, byte stream unchanged, full regression passes. Not yet re-run in
+  Vivado.
+- **Predictor RAM read, SECDED decode, then the DSP** (flight build only):
+  the line-buffer RAM output goes through `secded_dec`, the local-sum adders
+  and into a DSP input in one cycle (11 levels on XCKU060), and the weight RAM
+  through `secded_dec` into the weight multiply. These set the flight build's
+  Fmax at about 165 MHz on XCKU060-2. Fixing them needs a predictor stage after
+  the ECC decode (and matching hazard forwarding), which is still open.
+
 ## Targets
 
 | Part | Role | Status |
@@ -273,7 +304,7 @@ packs LUTs tighter.
 | Versal XQR | Next-generation flight part | Same vendor-neutral RTL; not synthesised yet |
 | Basys 3 (Artix-7) | Original edge-detection demo | Board wrapper and constraints kept |
 
-Vivado scripts (`scripts/vivado/`, not yet run):
+Vivado scripts (`scripts/vivado/`; `synth_ooc.tcl` has been run, see [Vivado results](#vivado-results)):
 
 ```
 vivado -mode batch -source scripts/vivado/synth_ooc.tcl -tclargs zcu106 payload   # payload on XCZU7EV, 250 MHz
@@ -288,8 +319,8 @@ open:
 
 | Item | Status |
 |---|---|
-| Timing closure | **Not run.** No Vivado timing or utilisation reports exist for the new design; the `Report/` PNGs are from the original Basys 3 design. The pipelines were written for 200 to 250 MHz, but that is unproven |
-| Vivado scripts, Basys 3 wrapper and constraints | Written, never run |
+| Timing closure | **Partly.** The payload meets 250 MHz on XCZU7EV; the flight build (ECC + TMR) does not meet 250 MHz on XCZU7EV or 200 MHz on XCKU060 (see [Vivado results](#vivado-results)). The `Report/` PNGs are from the original Basys 3 design |
+| Vivado scripts, Basys 3 wrapper and constraints | `synth_ooc.tcl` runs cleanly in Vivado 2018.2; `build_basys3.tcl`, the wrapper and constraints have not been run yet |
 | Official CCSDS test vectors | Not run directly. Conformance rests on the byte-exact match with the NTNU model, which its authors checked against them |
 | Configuration memory scrubbing | Not in this repo: it is the SEM IP on UltraScale, or built-in scrubbing on XQRKU060 and Versal, configured in Vivado |
 | Full datapath TMR, DDR ECC, latch-up protection | Only control state is triplicated here; the rest is a TMR tool's, the board's or the PS's job |
@@ -320,7 +351,7 @@ scripts/        regression runner, NTNU cross-check, Yosys and Vivado scripts
 3. **Done:** CCSDS 123.0-B-2 lossless compressor, byte-exact against an independent reference.
 4. **Done:** SECDED memories, TMR and fault-injection tests.
 5. **Done:** onboard analytics and the integrated payload top.
-6. Vivado timing and utilisation on ZCU106 and XCKU060 (needs Vivado, not a board: `synth_ooc.tcl` is ready).
+6. **Partly done:** Vivado timing and utilisation on ZCU106 and XCKU060. Open: pipeline the predictor's ECC decode for the flight build, and run the Basys 3 build.
 7. PS integration on the ZCU106: DMA, a Linux or bare-metal driver, CCSDS Space Packets over Ethernet to a PC ground station.
 8. Strip-parallel compressors for wide-swath line rates, and near-lossless mode (CCSDS 123.0-B-2 quantisation).
 9. SEM scrubbing and a full TMR flow for the flight part.

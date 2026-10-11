@@ -28,4 +28,5 @@ report_utilization    -file $OUT/utilization.rpt
 report_timing_summary -file $OUT/timing_summary.rpt
 report_cdc            -file $OUT/cdc.rpt
 report_power          -file $OUT/power.rpt
+write_checkpoint -force $OUT/routed.dcp
 write_bitstream -force $OUT/basys3_top.bit
