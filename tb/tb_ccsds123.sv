@@ -12,6 +12,16 @@
 // output byte, tkeep (contiguous, only short on the last word of an image),
 // tlast exactly at the end of each image, AXI-Stream stability under stall,
 // framing_err never set, no missing or extra output.
+//
+// Fault injection (FAULT, upsets injected on INJ_PM per mille of clocks):
+//   0  none
+//   1  single-bit memory upsets; needs ECC = 1. Output must stay byte-exact
+//      and the corrected-error counter must count them
+//   2  upsets in one copy of every TMR register; needs TMR = 1. Output must
+//      stay byte-exact and the TMR counter must count them
+//   3  single-bit memory upsets with ECC = 0 (control experiment): the output
+//      must be corrupted, which shows the injection really hits live state
+//   4  double-bit memory upsets with ECC = 1: must be detected (dbe counter)
 // -----------------------------------------------------------------------------
 module tb_ccsds123;
     parameter int NX          = 16;
@@ -36,6 +46,10 @@ module tb_ccsds123;
     parameter int READY_PCT   = 70;
     parameter int SEED        = 1;
     parameter int MAX_BYTES   = 1 << 20;
+    parameter bit ECC         = 1'b0;
+    parameter bit TMR         = 1'b0;
+    parameter int FAULT       = 0;
+    parameter int INJ_PM      = 5;
 
     localparam int NPIX = NX * NY * NZ;
     localparam int N_IN = NPIX * FRAMES;
@@ -50,19 +64,35 @@ module tb_ccsds123;
     logic [7:0]   m_tkeep;
     logic         m_tlast, m_tvalid, m_tready;
     logic         framing_err;
+    logic [15:0]  cnt_sbe, cnt_dbe, cnt_tmr;
+    logic         inj_sbe = 1'b0, inj_dbe = 1'b0, inj_tmr = 1'b0;
 
     ccsds123_top #(
         .NX(NX), .NY(NY), .NZ(NZ), .D(D), .P(P), .FULL(FULL), .LOCAL_SUM(LOCAL_SUM),
         .OMEGA(OMEGA), .R(R), .VMIN(VMIN), .VMAX(VMAX), .TINC_LOG2(TINC_LOG2),
-        .UMAX(UMAX), .GSTAR(GSTAR), .GAMMA0(GAMMA0), .KINIT(KINIT), .EMIT_HEADER(EMIT_HEADER)
+        .UMAX(UMAX), .GSTAR(GSTAR), .GAMMA0(GAMMA0), .KINIT(KINIT), .EMIT_HEADER(EMIT_HEADER),
+        .ECC(ECC), .TMR(TMR), .FAULT_INJ(FAULT != 0)
     ) dut (
         .clk, .rst,
         .s_axis_tdata(s_tdata), .s_axis_tvalid(s_tvalid), .s_axis_tready(s_tready),
         .s_axis_tuser(s_tuser), .s_axis_tlast(s_tlast),
         .m_axis_tdata(m_tdata), .m_axis_tkeep(m_tkeep), .m_axis_tlast(m_tlast),
         .m_axis_tvalid(m_tvalid), .m_axis_tready(m_tready),
-        .framing_err
+        .framing_err,
+        .cnt_ecc_sbe(cnt_sbe), .cnt_ecc_dbe(cnt_dbe), .cnt_tmr(cnt_tmr),
+        .inj_sbe, .inj_dbe, .inj_tmr
     );
+
+    // ------------------------------------------------------- fault injection
+    int seed_inj;
+    logic inj;
+    always @(posedge clk) begin
+        inj = !rst && FAULT != 0 && ($urandom(seed_inj) % 1000) < INJ_PM;
+        inj_sbe <= inj && (FAULT == 1 || FAULT == 3);
+        inj_dbe <= inj && FAULT == 4;
+        inj_tmr <= inj && FAULT == 2;
+        seed_inj = seed_inj + 1;
+    end
 
     logic [D-1:0] in_mem    [0:N_IN-1];
     logic [D-1:0] delta_mem [0:N_IN-1];
@@ -70,7 +100,8 @@ module tb_ccsds123;
     int           img_bytes [0:FRAMES-1];
     int           n_exp;
 
-    int errors = 0;
+    int errors = 0;      // protocol errors: always fatal
+    int diffs  = 0;      // data differences from the model (expected only for FAULT 3/4)
     int n_in   = 0;
     int n_dl   = 0;
     int n_byte = 0;      // bytes received in total
@@ -98,6 +129,7 @@ module tb_ccsds123;
         $readmemh(exp_file, exp_mem, 0, n_exp - 1);
         seed_drv = SEED;
         seed_snk = SEED * 7 + 3;
+        seed_inj = SEED * 13 + 5;
         $display("tb_ccsds123 %0dx%0dx%0d D=%0d P=%0d full=%0d local_sum=%0d header=%0d frames=%0d valid=%0d%% ready=%0d%% seed=%0d, %0d bytes expected",
                  NX, NY, NZ, D, P, FULL, LOCAL_SUM,
                  EMIT_HEADER, FRAMES, VALID_PCT, READY_PCT, SEED, n_exp);
@@ -134,10 +166,11 @@ module tb_ccsds123;
                 $display("ERROR: extra residual %0d", n_dl);
                 errors++;
             end else if (dut.p_delta !== delta_mem[n_dl]) begin
-                if (errors < 20)
-                    $display("ERROR: residual %0d (image %0d, pixel %0d, band %0d): got %0d, expected %0d",
+                if (diffs < 10)
+                    $display("%s: residual %0d (image %0d, pixel %0d, band %0d): got %0d, expected %0d",
+                             FAULT >= 3 ? "note" : "ERROR",
                              n_dl, n_dl / NPIX, (n_dl % NPIX) / NZ, n_dl % NZ, dut.p_delta, delta_mem[n_dl]);
-                errors++;
+                diffs++;
             end
             n_dl++;
         end
@@ -170,17 +203,23 @@ module tb_ccsds123;
                     errors++;
                 end else begin
                     exp_last = (img_b + nk >= img_bytes[img]);
-                    if (img_b + nk > img_bytes[img] || (nk != 8 && !m_tlast) || m_tlast !== exp_last) begin
-                        $display("ERROR: image %0d byte %0d: tlast=%b tkeep=%b, image has %0d bytes",
-                                 img, img_b, m_tlast, m_tkeep, img_bytes[img]);
+                    if (nk != 8 && !m_tlast) begin
+                        $display("ERROR: short word without tlast at image %0d byte %0d", img, img_b);
                         errors++;
+                    end
+                    if (img_b + nk > img_bytes[img] || m_tlast !== exp_last) begin
+                        if (diffs < 10)
+                            $display("%s: image %0d byte %0d: tlast=%b tkeep=%b, image has %0d bytes",
+                                     FAULT >= 3 ? "note" : "ERROR", img, img_b, m_tlast, m_tkeep, img_bytes[img]);
+                        diffs++;
                     end
                     for (int i = 0; i < nk; i++) begin
                         if (n_byte + i < n_exp && m_tdata[8*i +: 8] !== exp_mem[n_byte + i]) begin
-                            if (errors < 20)
-                                $display("ERROR: image %0d byte %0d: got %02h, expected %02h",
+                            if (diffs < 10)
+                                $display("%s: image %0d byte %0d: got %02h, expected %02h",
+                                         FAULT >= 3 ? "note" : "ERROR",
                                          img, img_b + i, m_tdata[8*i +: 8], exp_mem[n_byte + i]);
-                            errors++;
+                            diffs++;
                         end
                     end
                     n_byte += nk;
@@ -222,9 +261,25 @@ module tb_ccsds123;
             $display("ERROR: %0d of %0d residuals", n_dl, N_IN);
             errors++;
         end
-        if (errors == 0 && n_byte == n_exp) begin
-            $display("PASS: %0d samples -> %0d bytes (%0.2f:1), all residuals and bytes match the model, %0d cycles",
-                     N_IN, n_byte, real'(N_IN * D) / real'(8 * n_byte), cycles);
+        if (FAULT <= 2 && (diffs != 0 || n_byte != n_exp)) begin
+            $display("ERROR: %0d difference(s) from the model, %0d of %0d bytes", diffs, n_byte, n_exp);
+            errors++;
+        end
+        if (FAULT != 0)
+            $display("fault injection %0d: ecc corrected %0d, ecc uncorrectable %0d, tmr outvoted %0d, data differences %0d",
+                     FAULT, cnt_sbe, cnt_dbe, cnt_tmr, diffs);
+        if ((FAULT == 1 && (cnt_sbe == 0 || cnt_dbe != 0)) || (FAULT == 2 && cnt_tmr == 0) ||
+            (FAULT == 3 && diffs == 0) || (FAULT == 4 && cnt_dbe == 0) ||
+            (FAULT != 1 && FAULT != 4 && (cnt_sbe != 0 || cnt_dbe != 0)) || (FAULT != 2 && cnt_tmr != 0)) begin
+            $display("ERROR: fault-injection outcome not as expected");
+            errors++;
+        end
+        if (errors == 0) begin
+            if (FAULT == 0)
+                $display("PASS: %0d samples -> %0d bytes (%0.2f:1), all residuals and bytes match the model, %0d cycles",
+                         N_IN, n_byte, real'(N_IN * D) / real'(8 * n_byte), cycles);
+            else
+                $display("PASS: fault injection %0d behaved as expected", FAULT);
             $finish;
         end else begin
             $display("FAIL: %0d error(s), %0d of %0d bytes", errors, n_byte, n_exp);

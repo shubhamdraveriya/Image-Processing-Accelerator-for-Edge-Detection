@@ -30,6 +30,8 @@ module ccsds123_coder #(
     parameter int GSTAR  = 6,      // rescaling counter size gamma*
     parameter int GAMMA0 = 1,      // initial count exponent gamma_0
     parameter int KINIT  = 3,      // accumulator initialisation constant K
+    parameter bit ECC    = 1'b0,   // SECDED on the accumulator RAM
+    parameter bit TMR    = 1'b0,   // triplicated counter Gamma
     parameter int ZW     = (NZ > 1) ? $clog2(NZ) : 1,
     parameter int CW     = (D > 8) ? D : 8,    // code value width
     parameter int LW     = 6                   // code length width (max U_max + D = 48)
@@ -50,7 +52,14 @@ module ccsds123_coder #(
     output logic          m_first,     // first codeword of an image
     output logic          m_last,      // last codeword of an image
     output logic          m_valid,
-    input  logic          m_ready
+    input  logic          m_ready,
+
+    input  logic          inj_sbe,
+    input  logic          inj_dbe,
+    input  logic          inj_tmr,
+    output logic          ecc_sbe,
+    output logic          ecc_dbe,
+    output logic          tmr_err
 );
     localparam int GW = GSTAR;                    // Gamma < 2^gamma*
     localparam int AW = D + GSTAR + 2;            // Sigma < 2^(D + 1 + gamma*)
@@ -84,10 +93,10 @@ module ccsds123_coder #(
             else if (!s_t0) gamma_nx = (gamma == GW'(GMAX)) ? GW'(({1'b0, gamma} + 1'b1) >> 1) : gamma + 1'b1;
         end
     end
-    always_ff @(posedge clk) begin
-        if (rst)         gamma <= GW'(GAMMA1);
-        else if (accept) gamma <= gamma_nx;
-    end
+    tmr_reg #(.W(GW), .TMR(TMR), .RST_VAL(GW'(GAMMA1))) u_gamma (
+        .clk, .rst, .en (accept), .d (gamma_nx), .q (gamma),
+        .inj ({GW{inj_tmr}}), .mismatch (tmr_err)
+    );
 
     (* shreg_extract = "no" *) logic           v1, v2, v3;
     (* shreg_extract = "no" *) logic [D-1:0]   d1, d2;
@@ -98,10 +107,14 @@ module ccsds123_coder #(
     (* shreg_extract = "no" *) logic           fwd1;
     logic           acc_we;
 
-    sdp_ram #(.DW(AW), .DEPTH(NZ), .RAM_STYLE("auto")) u_acc (
-        .wclk (clk), .we (acc_we), .waddr (z1), .wdata (acc_wd),
-        .rclk (clk), .re (ce), .raddr (s_z), .rdata (acc_rd)
+    logic acc_sbe, acc_dbe;
+    ecc_sdp_ram #(.DW(AW), .DEPTH(NZ), .RAM_STYLE("auto"), .ECC(ECC)) u_acc (
+        .clk, .we (acc_we), .waddr (z1), .wdata (acc_wd),
+        .inj_sbe (inj_sbe && acc_we), .inj_dbe (inj_dbe && acc_we),
+        .re (ce), .raddr (s_z), .rdata (acc_rd), .sbe (acc_sbe), .dbe (acc_dbe)
     );
+    assign ecc_sbe = ce && v1 && acc_sbe;
+    assign ecc_dbe = ce && v1 && acc_dbe;
 
     always_ff @(posedge clk) begin
         if (rst) begin

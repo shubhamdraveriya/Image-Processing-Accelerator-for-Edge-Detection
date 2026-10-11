@@ -9,7 +9,8 @@
 #     scrubbing cannot correct SRL contents). Yosys ignores the per-signal
 #     shreg_extract = "no" attributes that Vivado honours, so SRL inference is
 #     switched off globally (-nosrl), as a flight Vivado flow would do; the
-#     check still catches SRLs instantiated by hand.
+#     check still catches SRLs instantiated by hand. The design is flattened
+#     (as Vivado does by default) so constants propagate across modules.
 # Writes per-family logs and a cell summary to build/yosys/.
 #
 # This proves the RTL is synthesisable and maps to the expected primitives.
@@ -20,20 +21,31 @@ OUT="$ROOT/build/yosys"
 mkdir -p "$OUT"
 status=0
 
-# top : source directories (defaults of each top's parameters are used)
-TOPS="${TOPS:-edge_accel_top:common,edge,top hs_frontend:common,hs ccsds123_top:common,ccsds123}"
+# top[@flight] : source directories. Default parameters are used; @flight
+# builds the same top with ECC = 1 and TMR = 1 (the flight configuration).
+TOPS="${TOPS:-edge_accel_top:common,edge,top hs_frontend:common,hs ccsds123_top:common,rel,ccsds123 ccsds123_top@flight:common,rel,ccsds123}"
 
 for entry in $TOPS; do
 top=${entry%%:*}
+chparam=""
+variant=""
+fams="xc7 xcu xcup"
+if [[ $top == *@flight ]]; then
+    top=${top%@flight}
+    chparam="chparam -set ECC 1 -set TMR 1 $top;"
+    variant="_flight"
+    fams="xcu xcup"          # flight targets: XQRKU060 (UltraScale) and ZCU106 / Versal-class parts
+fi
 SRCS=""
 for d in $(echo "${entry#*:}" | tr ',' ' '); do SRCS="$SRCS $ROOT/rtl/$d/*.sv"; done
-for fam in xc7 xcu xcup; do
-    tag="${top}_$fam"
+for fam in $fams; do
+    tag="${top}${variant}_$fam"
     log="$OUT/$tag.log"
     # Run from data/ so the ROM's $readmemh finds its image.
     if ! (cd "$ROOT/data" && yosys -q -l "$log" -p "
             read_verilog -sv -DSYNTHESIS $SRCS;
-            synth_xilinx -family $fam -top $top -nosrl;
+            $chparam
+            synth_xilinx -family $fam -top $top -nosrl -flatten;
             check -assert;
             select -assert-none t:SRL* t:\$dlatch t:\$_DLATCH_*;
             tee -o $OUT/$tag.stat stat" >/dev/null 2>&1); then
@@ -41,7 +53,9 @@ for fam in xc7 xcu xcup; do
         status=1
         continue
     fi
-    summary=$(awk '/=== design hierarchy ===/{f=1} f && /^ +(LUT|FD|RAM|CARRY|DSP|SRL)/{printf "%s=%s ", $1, $2}' "$OUT/$tag.stat")
+    # cell totals: the last count of each cell type (the design total)
+    summary=$(awk '/^ +(LUT|FD|RAM|CARRY|DSP|SRL)/{c[$1]=$2} END{for(k in c) print k "=" c[k]}' "$OUT/$tag.stat" \
+              | sort | tr '\n' ' ')
     echo "PASS  $tag  $summary"
 done
 done

@@ -44,6 +44,8 @@ module ccsds123_predictor #(
     parameter int VMAX      = 3,
     parameter int TINC_LOG2 = 6,
     parameter     LB_RAM_STYLE = "block",
+    parameter bit ECC       = 1'b0,    // SECDED on line buffer, band state and weights
+    parameter bit TMR       = 1'b0,    // triplicated position counters
     parameter int ZW        = (NZ > 1) ? $clog2(NZ) : 1
 ) (
     input  logic          clk,
@@ -63,7 +65,15 @@ module ccsds123_predictor #(
     output logic          m_valid,
     input  logic          m_ready,
 
-    output logic          framing_err
+    output logic          framing_err,
+
+    // reliability: error injection (tie to 0 in normal use) and error pulses
+    input  logic          inj_sbe,
+    input  logic          inj_dbe,
+    input  logic          inj_tmr,
+    output logic          ecc_sbe,
+    output logic          ecc_dbe,
+    output logic          tmr_err
 );
     // ------------------------------------------------------------ constants
     localparam int CZ   = P + (FULL ? 3 : 0);      // local difference vector length
@@ -120,33 +130,44 @@ module ccsds123_predictor #(
     assign cur_eol  = cur_xl && (cur_z == ZW'(NZ - 1));
     assign cur_last = cur_eol && (cur_y == YIW'(NY - 1));
 
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            x <= '0; y <= '0; z <= '0; li <= '0; t <= '0;
-            framing_err <= 1'b0;
-        end else begin
-            framing_err <= accept && (s_axis_tlast != cur_eol);
-            if (accept) begin
-                if (cur_z == ZW'(NZ - 1)) begin
-                    z <= '0;
-                    if (cur_xl) begin
-                        x  <= '0;
-                        li <= '0;
-                        y  <= cur_last ? '0 : cur_y + 1'b1;
-                        t  <= cur_last ? '0 : cur_t + 1'b1;
-                    end else begin
-                        x  <= cur_x + 1'b1;
-                        li <= cur_li + 1'b1;
-                        y  <= cur_y;
-                        t  <= cur_t + 1'b1;
-                    end
-                end else begin
-                    z  <= cur_z + 1'b1;
-                    li <= cur_li + 1'b1;
-                    x  <= cur_x; y <= cur_y; t <= cur_t;
-                end
+    // Position counters. An upset here would misplace every later sample of
+    // the image, so with TMR = 1 they are triplicated and voted.
+    localparam int CNTW = XIW + YIW + ZW + LIW + TW;
+    logic [XIW-1:0] x_nx;
+    logic [YIW-1:0] y_nx;
+    logic [ZW-1:0]  z_nx;
+    logic [LIW-1:0] li_nx;
+    logic [TW-1:0]  t_nx;
+
+    always_comb begin
+        x_nx = cur_x; y_nx = cur_y; t_nx = cur_t;
+        if (cur_z == ZW'(NZ - 1)) begin
+            z_nx = '0;
+            if (cur_xl) begin
+                x_nx  = '0;
+                li_nx = '0;
+                y_nx  = cur_last ? '0 : cur_y + 1'b1;
+                t_nx  = cur_last ? '0 : cur_t + 1'b1;
+            end else begin
+                x_nx  = cur_x + 1'b1;
+                li_nx = cur_li + 1'b1;
+                t_nx  = cur_t + 1'b1;
             end
+        end else begin
+            z_nx  = cur_z + 1'b1;
+            li_nx = cur_li + 1'b1;
         end
+    end
+
+    tmr_reg #(.W(CNTW), .TMR(TMR)) u_cnt (
+        .clk, .rst, .en (accept),
+        .d ({x_nx, y_nx, z_nx, li_nx, t_nx}), .q ({x, y, z, li, t}),
+        .inj ({CNTW{inj_tmr}}), .mismatch (tmr_err)
+    );
+
+    always_ff @(posedge clk) begin
+        if (rst) framing_err <= 1'b0;
+        else     framing_err <= accept && (s_axis_tlast != cur_eol);
     end
 
     // weight update scaling exponent rho(t), registered per sample
@@ -220,16 +241,20 @@ module ccsds123_predictor #(
     logic [LIW-1:0] ne_addr;
     assign ne_addr = cur_xl ? '0 : LIW'(cur_li + LIW'(NZ));
 
-    lb_ram_rf #(.DW(D), .DEPTH(NX * NZ), .RAM_STYLE(LB_RAM_STYLE)) u_lb (
+    logic lb_sbe, lb_dbe, bs_sbe, bs_dbe, wt_sbe, wt_dbe;
+
+    ecc_lb_ram_rf #(.DW(D), .DEPTH(NX * NZ), .RAM_STYLE(LB_RAM_STYLE), .ECC(ECC)) u_lb (
         .clk,
         .a_en (ce), .a_we (accept), .a_addr (cur_li), .a_wdata (s_axis_tdata), .a_rdata (n_q),
-        .b_en (ce), .b_addr (ne_addr), .b_rdata (ne_q)
+        .b_en (ce), .b_addr (ne_addr), .b_rdata (ne_q),
+        .inj_sbe (inj_sbe && accept), .inj_dbe (inj_dbe && accept), .sbe (lb_sbe), .dbe (lb_dbe)
     );
 
     // band state: {s, N} of this pixel become {W, NW} of the next one
-    sdp_ram #(.DW(2 * D), .DEPTH(NZ), .RAM_STYLE("auto")) u_bs (
-        .wclk (clk), .we (ce && v1), .waddr (z1), .wdata ({s1, n_q}),
-        .rclk (clk), .re (ce), .raddr (cur_z), .rdata (bs_q)
+    ecc_sdp_ram #(.DW(2 * D), .DEPTH(NZ), .RAM_STYLE("auto"), .ECC(ECC)) u_bs (
+        .clk, .we (ce && v1), .waddr (z1), .wdata ({s1, n_q}),
+        .inj_sbe (inj_sbe && ce && v1), .inj_dbe (inj_dbe && ce && v1),
+        .re (ce), .raddr (cur_z), .rdata (bs_q), .sbe (bs_sbe), .dbe (bs_dbe)
     );
 
     // ---------------------------------------------------------- P1 -> P2
@@ -281,10 +306,16 @@ module ccsds123_predictor #(
     logic [CZE*WW-1:0] w_rdata, w_wdata;
     logic              w_we;
 
-    sdp_ram #(.DW(CZE * WW), .DEPTH(NZ), .RAM_STYLE("auto")) u_weights (
-        .wclk (clk), .we (w_we), .waddr (z9), .wdata (w_wdata),
-        .rclk (clk), .re (ce), .raddr (z1), .rdata (w_rdata)
+    // one SECDED slice per weight, so each weight can lose a bit independently
+    ecc_sdp_ram #(.DW(CZE * WW), .DEPTH(NZ), .RAM_STYLE("auto"), .ECC(ECC), .SLICE(WW)) u_weights (
+        .clk, .we (w_we), .waddr (z9), .wdata (w_wdata),
+        .inj_sbe (inj_sbe && w_we), .inj_dbe (inj_dbe && w_we),
+        .re (ce), .raddr (z1), .rdata (w_rdata), .sbe (wt_sbe), .dbe (wt_dbe)
     );
+
+    // count each read once, when the sample that uses it moves on
+    assign ecc_sbe = ce && ((v1 && (lb_sbe || bs_sbe)) || (v2 && wt_sbe));
+    assign ecc_dbe = ce && ((v1 && (lb_dbe || bs_dbe)) || (v2 && wt_dbe));
 
     // ---------------------------------------------------------- P2 -> P3
     // central differences of the previous bands of this pixel (newest first)

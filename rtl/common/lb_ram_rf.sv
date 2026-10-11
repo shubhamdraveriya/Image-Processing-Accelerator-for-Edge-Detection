@@ -26,6 +26,9 @@ module lb_ram_rf #(
     generate
         if (RAM_STYLE == "ultra") begin : g_ultra
             (* ram_style = "ultra" *) logic [DW-1:0] mem [0:DEPTH-1];
+`ifndef SYNTHESIS
+            initial for (int i = 0; i < DEPTH; i++) mem[i] = '0;   // BRAM/LUTRAM power up as zero
+`endif
             always_ff @(posedge clk) if (a_en) begin
                 a_rdata <= mem[a_addr];
                 if (a_we) mem[a_addr] <= a_wdata;
@@ -33,6 +36,9 @@ module lb_ram_rf #(
             always_ff @(posedge clk) if (b_en) b_rdata <= mem[b_addr];
         end else if (RAM_STYLE == "block") begin : g_block
             (* ram_style = "block" *) logic [DW-1:0] mem [0:DEPTH-1];
+`ifndef SYNTHESIS
+            initial for (int i = 0; i < DEPTH; i++) mem[i] = '0;   // BRAM/LUTRAM power up as zero
+`endif
             always_ff @(posedge clk) if (a_en) begin
                 a_rdata <= mem[a_addr];
                 if (a_we) mem[a_addr] <= a_wdata;
@@ -40,6 +46,9 @@ module lb_ram_rf #(
             always_ff @(posedge clk) if (b_en) b_rdata <= mem[b_addr];
         end else begin : g_auto
             logic [DW-1:0] mem [0:DEPTH-1];
+`ifndef SYNTHESIS
+            initial for (int i = 0; i < DEPTH; i++) mem[i] = '0;   // BRAM/LUTRAM power up as zero
+`endif
             always_ff @(posedge clk) if (a_en) begin
                 a_rdata <= mem[a_addr];
                 if (a_we) mem[a_addr] <= a_wdata;

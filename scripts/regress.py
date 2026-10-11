@@ -24,7 +24,8 @@ RTL_CORE = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl"
 RTL_TOP = RTL_CORE + sorted((ROOT / "rtl" / "top").glob("*.sv"))
 RTL_HS = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "hs").glob("*.sv"))
 HS_GOLDEN = [sys.executable, str(ROOT / "model" / "hs_golden.py")]
-RTL_CCSDS = (sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "ccsds123").glob("*.sv")))
+RTL_CCSDS = (sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "rel").glob("*.sv"))
+             + sorted((ROOT / "rtl" / "ccsds123").glob("*.sv")))
 CCSDS_MODEL = [sys.executable, str(ROOT / "model" / "ccsds123.py")]
 
 MODE = {"sobel": 0, "pool": 1, "pipeline": 2}
@@ -83,9 +84,23 @@ CCSDS_CASES = [
                                           image="random", seed=11), 90, 50),
     ("c123_body_only_2_frames",      dict(frames=2, header=0, gstar=11, g0=5, seed=12), 85, 85),
     ("c123_d14_64x16x32",            dict(nx=64, ny=16, nz=32, d=14, p=8, seed=13), 100, 100),
+    # reliability (flight build: ecc=1 tmr=1); fault: 1 single-bit memory
+    # upsets, 2 TMR register upsets, 3 single-bit upsets without ECC (control:
+    # must corrupt), 4 double-bit upsets (must be detected); inj = per mille
+    ("rel_flight_build_clean",       dict(nx=24, ny=8, nz=16, d=14, p=8, ecc=1, tmr=1, seed=14), 80, 70),
+    ("rel_seu_memory_corrected",     dict(ecc=1, tmr=1, fault=1, inj=20, frames=2, seed=15), 90, 80),
+    ("rel_seu_weights_p15_corrected",dict(nx=24, ny=6, nz=20, d=16, p=15, omega=19, k=14, ecc=1, tmr=1,
+                                          fault=1, inj=30, seed=16), 90, 90),
+    ("rel_seu_registers_outvoted",   dict(ecc=1, tmr=1, fault=2, inj=20, frames=2, seed=17), 90, 80),
+    ("rel_seu_unprotected_corrupts", dict(fault=3, inj=5, seed=18), 90, 80),
+    ("rel_seu_double_detected",      dict(ecc=1, fault=4, inj=5, seed=19), 90, 80),
 ]
+
+# SECDED code: every 1- and 2-bit error pattern for these data widths
+SECDED_WIDTHS = [1, 4, 8, 11, 16, 26, 32, 57, 64]
 CCSDS_DEFAULT = dict(nx=16, ny=8, nz=10, d=12, p=3, reduced=0, column=0, omega=13, r=64, vmin=-1, vmax=3,
-                     tinc=6, umax=18, gstar=6, g0=1, k=3, image="scene", frames=1, seed=1, header=1)
+                     tinc=6, umax=18, gstar=6, g0=1, k=3, image="scene", frames=1, seed=1, header=1,
+                     ecc=0, tmr=0, fault=0, inj=5)
 
 
 def run(cmd: list[str], log: Path) -> tuple[bool, str]:
@@ -210,10 +225,24 @@ def main() -> int:
                           LOCAL_SUM=2 if c["column"] else 0, OMEGA=c["omega"], R=c["r"], VMIN=c["vmin"],
                           VMAX=c["vmax"], TINC_LOG2=c["tinc"], UMAX=c["umax"], GSTAR=c["gstar"], GAMMA0=c["g0"],
                           KINIT=c["k"], EMIT_HEADER=c["header"], FRAMES=c["frames"], VALID_PCT=vp, READY_PCT=rp,
-                          SEED=c["seed"])
+                          SEED=c["seed"], ECC=c["ecc"], TMR=c["tmr"], FAULT=c["fault"], INJ_PM=c["inj"])
             ok, out = build_and_run(args.sim, "tb_ccsds123", RTL_CCSDS + [ROOT / "tb" / "tb_ccsds123.sv"], params,
                                     [f"+IN={vec}_in.hex", f"+DELTA={vec}_delta.hex", f"+EXP={vec}_exp.hex",
                                      f"+META={vec}_meta.txt"], wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    for dw in SECDED_WIDTHS:
+        name = f"rel_secded_{dw}b"
+        if args.k not in name:
+            continue
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        t0 = time.time()
+        ok, out = build_and_run(args.sim, "tb_secded",
+                                [ROOT / "rtl" / "rel" / "secded_enc.sv", ROOT / "rtl" / "rel" / "secded_dec.sv",
+                                 ROOT / "tb" / "tb_secded.sv"], dict(DW=dw, WORDS=20 if dw <= 32 else 4), [], wd, log)
         results.append((name, ok and "PASS:" in out, time.time() - t0, log))
 
     if not results:
