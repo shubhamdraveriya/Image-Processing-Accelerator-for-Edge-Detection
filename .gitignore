@@ -1,0 +1,9 @@
+build/
+__pycache__/
+.pytest_cache/
+*.vcd
+*.fst
+.Xil/
+*.jou
+*.log
+vivado_out/

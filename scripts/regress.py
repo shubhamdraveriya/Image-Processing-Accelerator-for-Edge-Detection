@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Run the self-checking RTL regression with Icarus Verilog or Verilator.
+
+Each case generates stimulus + expected output with model/edge_golden.py,
+builds the testbench with the case parameters and checks for PASS.
+
+  python3 scripts/regress.py                 # all cases, Icarus
+  python3 scripts/regress.py --sim verilator # all cases, Verilator
+  python3 scripts/regress.py -k pipeline     # only cases whose name matches
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BUILD = ROOT / "build" / "regress"
+GOLDEN = [sys.executable, str(ROOT / "model" / "edge_golden.py")]
+
+RTL_CORE = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "edge").glob("*.sv"))
+RTL_TOP = RTL_CORE + sorted((ROOT / "rtl" / "top").glob("*.sv"))
+
+MODE = {"sobel": 0, "pool": 1, "pipeline": 2}
+
+# name, mode, DW, W, H, frames, valid %, ready %, seed
+STAGE_CASES = [
+    ("sobel_8b_64x64_full_rate",   "sobel",    8,  64, 64, 2, 100, 100, 1),
+    ("sobel_8b_64x64_stress",      "sobel",    8,  64, 64, 2,  60,  40, 2),
+    ("sobel_10b_37x21_odd_size",   "sobel",   10,  37, 21, 3,  80,  70, 3),
+    ("sobel_12b_3x3_minimum",      "sobel",   12,   3,  3, 4,  90,  30, 4),
+    ("pool_8b_62x62_full_rate",    "pool",     8,  62, 62, 2, 100, 100, 5),
+    ("pool_10b_2x2_minimum",       "pool",    10,   2,  2, 4,  50,  50, 6),
+    ("pool_12b_18x6_stress",       "pool",    12,  18,  6, 3,  70,  20, 7),
+    ("pipeline_8b_64x64_full",     "pipeline", 8,  64, 64, 2, 100, 100, 8),
+    ("pipeline_8b_64x64_stress",   "pipeline", 8,  64, 64, 3,  75,  35, 9),
+    ("pipeline_10b_128x16_wide",   "pipeline",10, 128, 16, 2,  85,  60, 10),
+    ("pipeline_16b_34x20",         "pipeline",16,  34, 20, 3,  70,  80, 11),
+    ("pipeline_12b_6x4_tiny",      "pipeline",12,   6,  4, 5,  30,  90, 12),
+]
+
+# name, image source, frames, src half period, proc half period, ready %
+TOP_CASES = [
+    ("top_stripes_100_200MHz",  "stripes", 2, 5.0, 2.5,  70),
+    ("top_random_100_200MHz",   "random",  2, 5.0, 2.5,  50),
+    ("top_random_fast_src",     "random",  2, 2.0, 3.7, 100),
+]
+
+
+def run(cmd: list[str], log: Path) -> tuple[bool, str]:
+    with log.open("a") as f:
+        f.write("$ " + " ".join(cmd) + "\n")
+        p = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        f.write(p.stdout)
+    return p.returncode == 0, p.stdout
+
+
+def build_and_run(sim: str, top: str, sources: list[Path], params: dict, plusargs: list[str],
+                  wd: Path, log: Path) -> tuple[bool, str]:
+    srcs = [str(s) for s in sources]
+    if sim == "icarus":
+        vvp = wd / "sim.vvp"
+        cmd = ["iverilog", "-g2012", "-o", str(vvp), "-s", top]
+        cmd += [f"-P{top}.{k}={v}" for k, v in params.items()]
+        ok, out = run(cmd + srcs, log)
+        if not ok:
+            return False, out
+        return run(["vvp", "-n", str(vvp)] + plusargs, log)
+    obj = wd / "obj"
+    cmd = ["verilator", "--binary", "--timing", "-j", "0", "-Wno-fatal", "-Wno-lint", "-Wno-style",
+           "--top-module", top, "-Mdir", str(obj)]
+    cmd += [f"-G{k}={v}" for k, v in params.items()]
+    ok, out = run(cmd + srcs, log)
+    if not ok:
+        return False, out
+    return run([str(obj / f"V{top}")] + plusargs, log)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sim", choices=["icarus", "verilator"], default="icarus")
+    ap.add_argument("-k", default="", help="only run cases whose name contains this")
+    args = ap.parse_args()
+
+    results = []
+    for name, mode, dw, w, h, frames, vp, rp, seed in STAGE_CASES:
+        if args.k not in name:
+            continue
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        vec = wd / "vec"
+        t0 = time.time()
+        ok, out = run(GOLDEN + ["vectors", "--mode", mode, "--dw", str(dw), "--w", str(w), "--h", str(h),
+                                "--frames", str(frames), "--seed", str(seed), "--out", str(vec)], log)
+        if ok:
+            params = dict(MODE=MODE[mode], DW=dw, IMG_W=w, IMG_H=h, FRAMES=frames,
+                          VALID_PCT=vp, READY_PCT=rp, SEED=seed)
+            ok, out = build_and_run(args.sim, "tb_axis_stage", RTL_CORE + [ROOT / "tb" / "tb_axis_stage.sv"],
+                                    params, [f"+IN={vec}_in.hex", f"+EXP={vec}_exp.hex"], wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    for name, image, frames, src_half, proc_half, rp in TOP_CASES:
+        if args.k not in name:
+            continue
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        t0 = time.time()
+        ok = True
+        if image == "stripes":
+            mem = ROOT / "data" / "image_stripes_64x64.mem"
+        else:
+            ok, _ = run(GOLDEN + ["vectors", "--mode", "pipeline", "--w", "64", "--h", "64", "--frames", "1",
+                                  "--seed", "42", "--out", str(wd / "img")], log)
+            mem = wd / "img_in.hex"
+        out = ""
+        if ok:
+            ok, out = run(GOLDEN + ["expect", "--mode", "pipeline", "--w", "64", "--h", "64",
+                                    "--frames", str(frames), "--mem", str(mem), "--out", str(wd / "top")], log)
+        if ok:
+            params = dict(FRAMES=frames, INIT_FILE=f'"{mem}"' if args.sim == "icarus" else f'"{mem}"',
+                          SRC_HALF=src_half, PROC_HALF=proc_half, READY_PCT=rp)
+            ok, out = build_and_run(args.sim, "tb_edge_accel_top", RTL_TOP + [ROOT / "tb" / "tb_edge_accel_top.sv"],
+                                    params, [f"+EXP={wd / 'top'}_exp.hex"], wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    if not results:
+        print("no cases matched")
+        return 1
+    width = max(len(r[0]) for r in results)
+    for name, ok, dt, log in results:
+        print(f"{name:<{width}}  {'PASS' if ok else 'FAIL'}  {dt:6.1f}s" + ("" if ok else f"  (see {log.relative_to(ROOT)})"))
+    n_fail = sum(not r[1] for r in results)
+    print(f"\n{len(results) - n_fail}/{len(results)} passed ({args.sim})")
+    return 1 if n_fail else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

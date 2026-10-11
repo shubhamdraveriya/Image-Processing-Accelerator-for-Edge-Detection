@@ -1,0 +1,4 @@
+`verilator_config
+// Vivado-generated IP stubs are black boxes; their ports look unused/undriven.
+lint_off -rule UNDRIVEN -file "*clk_wiz_0_stub.v"
+lint_off -rule UNUSEDSIGNAL -file "*clk_wiz_0_stub.v"
