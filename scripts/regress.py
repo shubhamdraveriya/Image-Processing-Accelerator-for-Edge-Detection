@@ -27,6 +27,14 @@ HS_GOLDEN = [sys.executable, str(ROOT / "model" / "hs_golden.py")]
 RTL_CCSDS = (sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "rel").glob("*.sv"))
              + sorted((ROOT / "rtl" / "ccsds123").glob("*.sv")))
 CCSDS_MODEL = [sys.executable, str(ROOT / "model" / "ccsds123.py")]
+RTL_AN = (sorted((ROOT / "rtl" / "common").glob("*.sv")) + [ROOT / "rtl" / "edge" / "sobel_core.sv"]
+          + sorted((ROOT / "rtl" / "analytics").glob("*.sv")))
+AN_MODEL = [sys.executable, str(ROOT / "model" / "analytics_golden.py")]
+RTL_PL = (sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "rel").glob("*.sv"))
+          + [ROOT / "rtl" / "edge" / "sobel_core.sv"] + sorted((ROOT / "rtl" / "hs").glob("*.sv"))
+          + sorted((ROOT / "rtl" / "ccsds123").glob("*.sv")) + sorted((ROOT / "rtl" / "analytics").glob("*.sv"))
+          + sorted((ROOT / "rtl" / "payload").glob("*.sv")))
+PL_MODEL = [sys.executable, str(ROOT / "model" / "payload_golden.py")]
 
 MODE = {"sobel": 0, "pool": 1, "pipeline": 2}
 
@@ -101,6 +109,33 @@ SECDED_WIDTHS = [1, 4, 8, 11, 16, 26, 32, 57, 64]
 CCSDS_DEFAULT = dict(nx=16, ny=8, nz=10, d=12, p=3, reduced=0, column=0, omega=13, r=64, vmin=-1, vmax=3,
                      tinc=6, umax=18, gstar=6, g0=1, k=3, image="scene", frames=1, seed=1, header=1,
                      ecc=0, tmr=0, fault=0, inj=5)
+
+# onboard analytics: name, D, NX, NY, NB, frames, random image (or "vary": scene with a new
+# configuration every frame), cloud_max, valid %, ready %, seed
+AN_CASES = [
+    ("an_scene_12b_32x24x16_stress",  12, 32, 24, 16, 2, False,  32,  80,  60, 1),
+    ("an_scene_14b_48x16x32_full",    14, 48, 16, 32, 2, False,  32, 100, 100, 2),
+    ("an_random_16b_20x12x8",         16, 20, 12,  8, 2, True,   32,  70,  80, 3),
+    ("an_minimum_3x3_single_band",    10,  3,  3,  1, 4, True,   32,  90,  50, 4),
+    ("an_minimum_3x3_back_to_back",   10,  3,  3,  1, 6, True,   32, 100, 100, 8),
+    ("an_random_per_frame_cfg",       12, 12,  8,  6, 6, True,   32, 100, 100, 9),
+    ("an_random_back_to_back_4x3x2",  12,  4,  3,  2, 8, True,   32, 100, 100, 11),
+    ("an_scene_per_frame_cfg",        12, 16, 12,  8, 4, "vary", 32,  90,  80, 12),
+    ("an_two_bands_64x6",              8, 64,  6,  2, 2, True,   32,  95,  95, 5),
+    ("an_keep_never_cloudy",          12, 24, 10, 12, 2, False,   0,  85,  85, 6),
+    ("an_keep_always",                12, 24, 10, 12, 2, False, 256,  85,  85, 7),
+    ("an_keep_boundary_16x16",        12, 16, 16,  8, 4, False, "auto", 90, 90, 10),
+]
+
+# whole payload: name, D, NX, NY, NB (sensor), NZ (kept), P, frames, ECC/TMR, valid %, ready %,
+# analytics outputs ready %, seed
+PL_CASES = [
+    ("payload_12b_24x12_24to12",      12, 24, 12, 24, 12, 3, 2, 0, 85, 75, 75, 1),
+    ("payload_flight_ecc_tmr",        12, 24, 12, 24, 12, 3, 2, 1, 85, 75, 75, 2),
+    ("payload_14b_32x16_48to20_p6",   14, 32, 16, 48, 20, 6, 2, 0, 100, 100, 100, 3),
+    ("payload_10b_16x8_40to6_stress", 10, 16,  8, 40,  6, 2, 3, 1, 60, 40, 40, 4),
+    ("payload_analytics_backpressure", 12, 16, 8, 16,  4, 2, 2, 0, 100, 100, 5, 5),
+]
 
 
 def run(cmd: list[str], log: Path) -> tuple[bool, str]:
@@ -229,6 +264,47 @@ def main() -> int:
             ok, out = build_and_run(args.sim, "tb_ccsds123", RTL_CCSDS + [ROOT / "tb" / "tb_ccsds123.sv"], params,
                                     [f"+IN={vec}_in.hex", f"+DELTA={vec}_delta.hex", f"+EXP={vec}_exp.hex",
                                      f"+META={vec}_meta.txt"], wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    for name, d, nx, ny, nb, frames, rnd, cmax, vp, rp, seed in AN_CASES:
+        if args.k not in name:
+            continue
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        vec = wd / "vec"
+        t0 = time.time()
+        cmd = AN_MODEL + ["vectors", "--d", str(d), "--nx", str(nx), "--ny", str(ny), "--nb", str(nb),
+                          "--frames", str(frames), "--seed", str(seed), "--cloud-max", str(cmax), "--out", str(vec)]
+        ok, out = run(cmd + {True: ["--random"], False: [], "vary": ["--vary-cfg"]}[rnd], log)
+        if ok:
+            ok, out = build_and_run(args.sim, "tb_analytics", RTL_AN + [ROOT / "tb" / "tb_analytics.sv"],
+                                    dict(D=d, NX=nx, NY=ny, NB=nb, FRAMES=frames, VALID_PCT=vp, READY_PCT=rp,
+                                         SEED=seed),
+                                    [f"+IN={vec}_in.hex", f"+PROD={vec}_prod.hex", f"+EDGE={vec}_edge.hex",
+                                     f"+SUM={vec}_sum.txt", f"+CFG={vec}_cfg.txt"], wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    for name, d, nx, ny, nb, nz, pp, frames, flight, vp, rp, arp, seed in PL_CASES:
+        if args.k not in name:
+            continue
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        vec = wd / "vec"
+        t0 = time.time()
+        ok, out = run(PL_MODEL + ["vectors", "--d", str(d), "--nx", str(nx), "--ny", str(ny), "--nb", str(nb),
+                                  "--nz", str(nz), "--p", str(pp), "--frames", str(frames), "--seed", str(seed),
+                                  "--out", str(vec)], log)
+        if ok:
+            ok, out = build_and_run(args.sim, "tb_payload", RTL_PL + [ROOT / "tb" / "tb_payload.sv"],
+                                    dict(D=d, NX=nx, NY=ny, NB=nb, NZ=nz, P=pp, FRAMES=frames, ECC=flight,
+                                         TMR=flight, VALID_PCT=vp, READY_PCT=rp, AN_READY_PCT=arp, SEED=seed),
+                                    [f"+IN={vec}_in.hex", f"+COMP={vec}_comp.hex", f"+META={vec}_comp_meta.txt",
+                                     f"+PROD={vec}_prod.hex", f"+EDGE={vec}_edge.hex", f"+CFG={vec}_cfg.txt",
+                                     f"+REGS={vec}_regs.txt"], wd, log)
         results.append((name, ok and "PASS:" in out, time.time() - t0, log))
 
     for dw in SECDED_WIDTHS:

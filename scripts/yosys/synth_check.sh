@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Board-free synthesis check with Yosys (no Vivado needed).
 #
-# Synthesises each top (edge_accel_top, hs_frontend, ccsds123_top) for 7-series (Basys 3), UltraScale (KU060 /
-# XQRKU060) and UltraScale+ (ZCU106) cell libraries and fails if:
+# Synthesises each top (edge_accel_top, hs_frontend, ccsds123_top, analytics_top, payload_top, and the flight
+# builds of ccsds123_top and payload_top) for 7-series (Basys 3), UltraScale (KU060 / XQRKU060) and UltraScale+
+# (ZCU106) cell libraries and fails if:
 #   - the RTL does not elaborate or synthesise,
 #   - the netlist has latches or other check problems,
 #   - any SRL primitive appears (banned in the flight build: configuration
@@ -23,7 +24,7 @@ status=0
 
 # top[@flight] : source directories. Default parameters are used; @flight
 # builds the same top with ECC = 1 and TMR = 1 (the flight configuration).
-TOPS="${TOPS:-edge_accel_top:common,edge,top hs_frontend:common,hs ccsds123_top:common,rel,ccsds123 ccsds123_top@flight:common,rel,ccsds123}"
+TOPS="${TOPS:-edge_accel_top:common,edge,top hs_frontend:common,hs ccsds123_top:common,rel,ccsds123 ccsds123_top@flight:common,rel,ccsds123 analytics_top:common,edge,analytics payload_top:common,rel,edge,hs,ccsds123,analytics,payload payload_top@flight:common,rel,edge,hs,ccsds123,analytics,payload}"
 
 for entry in $TOPS; do
 top=${entry%%:*}
