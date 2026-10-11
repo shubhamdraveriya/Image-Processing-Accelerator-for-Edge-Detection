@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Board-free synthesis check with Yosys (no Vivado needed).
 #
-# Synthesises edge_accel_top for 7-series (Basys 3), UltraScale (KU060 /
+# Synthesises each top (edge_accel_top, hs_frontend) for 7-series (Basys 3), UltraScale (KU060 /
 # XQRKU060) and UltraScale+ (ZCU106) cell libraries and fails if:
 #   - the RTL does not elaborate or synthesise,
 #   - the netlist has latches or other check problems,
@@ -15,23 +15,31 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="$ROOT/build/yosys"
 mkdir -p "$OUT"
-SRCS="$ROOT/rtl/common/*.sv $ROOT/rtl/edge/*.sv $ROOT/rtl/top/*.sv"
 status=0
 
+# top : source directories (defaults of each top's parameters are used)
+TOPS="edge_accel_top:common,edge,top hs_frontend:common,hs"
+
+for entry in $TOPS; do
+top=${entry%%:*}
+SRCS=""
+for d in $(echo "${entry#*:}" | tr ',' ' '); do SRCS="$SRCS $ROOT/rtl/$d/*.sv"; done
 for fam in xc7 xcu xcup; do
-    log="$OUT/$fam.log"
+    tag="${top}_$fam"
+    log="$OUT/$tag.log"
     # Run from data/ so the ROM's $readmemh finds its image.
     if ! (cd "$ROOT/data" && yosys -q -l "$log" -p "
             read_verilog -sv -DSYNTHESIS $SRCS;
-            synth_xilinx -family $fam -top edge_accel_top;
+            synth_xilinx -family $fam -top $top;
             check -assert;
             select -assert-none t:SRL* t:\$dlatch t:\$_DLATCH_*;
-            tee -o $OUT/$fam.stat stat" >/dev/null 2>&1); then
-        echo "FAIL  $fam  (see build/yosys/$fam.log)"
+            tee -o $OUT/$tag.stat stat" >/dev/null 2>&1); then
+        echo "FAIL  $tag  (see build/yosys/$tag.log)"
         status=1
         continue
     fi
-    summary=$(awk '/=== design hierarchy ===/{f=1} f && /^ +(LUT|FD|RAM|CARRY|DSP|SRL)/{printf "%s=%s ", $1, $2}' "$OUT/$fam.stat")
-    echo "PASS  $fam  $summary"
+    summary=$(awk '/=== design hierarchy ===/{f=1} f && /^ +(LUT|FD|RAM|CARRY|DSP|SRL)/{printf "%s=%s ", $1, $2}' "$OUT/$tag.stat")
+    echo "PASS  $tag  $summary"
+done
 done
 exit $status

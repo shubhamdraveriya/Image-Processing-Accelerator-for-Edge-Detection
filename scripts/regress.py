@@ -22,6 +22,8 @@ GOLDEN = [sys.executable, str(ROOT / "model" / "edge_golden.py")]
 
 RTL_CORE = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "edge").glob("*.sv"))
 RTL_TOP = RTL_CORE + sorted((ROOT / "rtl" / "top").glob("*.sv"))
+RTL_HS = sorted((ROOT / "rtl" / "common").glob("*.sv")) + sorted((ROOT / "rtl" / "hs").glob("*.sv"))
+HS_GOLDEN = [sys.executable, str(ROOT / "model" / "hs_golden.py")]
 
 MODE = {"sobel": 0, "pool": 1, "pipeline": 2}
 
@@ -46,6 +48,17 @@ TOP_CASES = [
     ("top_stripes_100_200MHz",  "stripes", 2, 5.0, 2.5,  70),
     ("top_random_100_200MHz",   "random",  2, 5.0, 2.5,  50),
     ("top_random_fast_src",     "random",  2, 2.0, 3.7, 100),
+]
+
+# name, DW, NX, NB, NY, frames, line period, expect overrun, valid %, ready %, seed
+HS_CASES = [
+    ("hs_12b_32x16_stress",        12,  32, 16, 6, 2,    0, 0,  80,  70, 1),
+    ("hs_16b_24x40_two_mask_words",16,  24, 40, 4, 2,    0, 0,  90,  60, 2),
+    ("hs_10b_2x1_minimum",         10,   2,  1, 5, 3,    0, 0,  50,  50, 3),
+    ("hs_12b_40x1_single_band",    12,  40,  1, 4, 2,    0, 0,  95,  95, 7),
+    ("hs_14b_64x8_full_rate",      14,  64,  8, 4, 2,    0, 0, 100, 100, 4),
+    ("hs_12b_16x8_paced",          12,  16,  8, 6, 2,  200, 0, 100, 100, 5),
+    ("hs_12b_16x8_overrun",        12,  16,  8, 6, 2,  130, 1, 100,  30, 6),
 ]
 
 
@@ -127,6 +140,27 @@ def main() -> int:
                           SRC_HALF=src_half, PROC_HALF=proc_half, READY_PCT=rp)
             ok, out = build_and_run(args.sim, "tb_edge_accel_top", RTL_TOP + [ROOT / "tb" / "tb_edge_accel_top.sv"],
                                     params, [f"+EXP={wd / 'top'}_exp.hex"], wd, log)
+        results.append((name, ok and "PASS:" in out, time.time() - t0, log))
+
+    for name, dw, nx, nb, ny, frames, period, ovr, vp, rp, seed in HS_CASES:
+        if args.k not in name:
+            continue
+        wd = BUILD / args.sim / name
+        wd.mkdir(parents=True, exist_ok=True)
+        log = wd / "run.log"
+        log.write_text("")
+        vec = wd / "vec"
+        t0 = time.time()
+        ok, out = run(HS_GOLDEN + ["vectors", "--dw", str(dw), "--nx", str(nx), "--nb", str(nb), "--ny", str(ny),
+                                   "--frames", str(frames), "--seed", str(seed), "--period", str(period),
+                                   "--out", str(vec)], log)
+        if ok:
+            meta = dict(l.split("=") for l in Path(f"{vec}_meta.txt").read_text().split())
+            params = dict(DW=dw, NX=nx, NB=nb, NY=ny, FRAMES=frames, NSEL=meta["nsel"], NREPL=meta["nrepl"],
+                          PERIOD=period, EXPECT_OVR=ovr, VALID_PCT=vp, READY_PCT=rp, SEED=seed)
+            ok, out = build_and_run(args.sim, "tb_hs_frontend", RTL_HS + [ROOT / "tb" / "tb_hs_frontend.sv"],
+                                    params, [f"+IN={vec}_in.hex", f"+EXP={vec}_exp.hex", f"+CFG={vec}_cfg.txt"],
+                                    wd, log)
         results.append((name, ok and "PASS:" in out, time.time() - t0, log))
 
     if not results:

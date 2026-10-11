@@ -5,8 +5,10 @@ foundation of a larger project: an onboard hyperspectral payload processor
 (calibration plus CCSDS 123.0-B-2 compression) for Zynq UltraScale+ (ZCU106),
 with a datapath that also synthesises for the rad-tolerant AMD XQRKU060.
 
-This repository is at **phase 1**: the original Basys 3 design, cleaned up
-into a parameterised, AXI4-Stream, fully verified core.
+Progress so far:
+- **Phase 1:** the original Basys 3 design, cleaned up into a parameterised,
+  AXI4-Stream, fully verified core.
+- **Phase 2:** a hyperspectral pushbroom front end (`rtl/hs/`).
 
 ## Pipeline
 
@@ -46,6 +48,37 @@ and no garbage from uninitialised line buffers.
 not accepted, and register slices between blocks keep `tready` off the
 critical path. No pixel is ever dropped, from the ROM to the serial pins.
 
+## Hyperspectral front end (`rtl/hs/`)
+
+The stream is band-interleaved-by-pixel (BIP), like a pushbroom detector
+readout: band 0..NB-1 of pixel 0, then pixel 1, and so on. Each line holds
+`NX * NB` samples. `tuser` marks the first sample of a frame and `tlast` the
+last sample of a line.
+
+```
+s_axis ─▶ line_pacer ─▶ radiometric_corr ─▶ badpix_replace ─▶ band_select ─▶ m_axis
+           line timing   (x - dark) * gain    nearest-left good   keep masked bands
+                    (register slice between every block, AXI4-Lite register map)
+```
+
+| Block | What it does |
+|---|---|
+| `line_pacer` | Starts at most one line every `LINE_PERIOD` cycles, which emulates the detector's line rate when replaying from DDR. Counts overruns when backpressure makes a line miss its slot |
+| `radiometric_corr` | `clamp(((x - dark[p,b]) * gain[p,b] + 2^(GF-1)) >> GF)`, with per pixel/band tables and one DSP48 |
+| `badpix_replace` | Replaces a flagged sample with the last good sample to its left in the same band (0 if there is none) |
+| `band_select` | Keeps the bands set in `BAND_MASK`, the way Pixxel Firefly keeps ~45 of its ~135 bands. The mask switches only at frame start |
+| `hs_frontend` | Chains the four blocks, with an AXI4-Lite slave (`axil_cfg_bridge`), table loading and telemetry counters |
+
+The register map is documented at the top of `rtl/hs/hs_frontend.sv`. It
+covers ID, geometry, line period, band mask, the dark/gain/bad-pixel tables,
+and counters for overruns, framing errors, lines out and replaced samples.
+
+`model/hs_golden.py` is the bit-exact reference. It also generates a
+synthetic scene with water, vegetation (red edge), soil and cloud spectra,
+plus dark offsets, gain spread, dead columns and saturating samples.
+`tb/tb_hs_frontend.sv` programs the design over AXI4-Lite, streams the cube
+with random stalls, checks every sample, then reads the counters back.
+
 ## Fixes against the original design
 
 | Original problem | Now |
@@ -82,7 +115,9 @@ Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), Python 3 with
 - `tb/tb_edge_accel_top.sv` runs the whole design across two unrelated
   clocks (including a source faster than the processing clock), de-serializes
   the output pins and checks every pixel.
-- `scripts/regress.py` lists the 15 cases: 8/10/12/16-bit, minimum sizes,
+- `tb/tb_hs_frontend.sv` covers the hyperspectral front end, including
+  AXI4-Lite programming, line pacing and overrun detection.
+- `scripts/regress.py` lists the cases: 8/10/12/16-bit, minimum sizes,
   odd sizes, full rate and heavy stalls. CI (`.github/workflows/ci.yml`) runs
   everything on every push.
 - `scripts/yosys/synth_check.sh` synthesises `edge_accel_top` with Yosys
