@@ -1,68 +1,70 @@
-# Image Processing Accelerator for Edge Detection
+# Onboard Hyperspectral Payload Processor
 
-A streaming Sobel edge-detection accelerator in SystemVerilog. It is the
-foundation of a larger project: an onboard hyperspectral payload processor
-(calibration plus CCSDS 123.0-B-2 compression) for Zynq UltraScale+ (ZCU106),
-with a datapath that also synthesises for the rad-tolerant AMD XQRKU060.
+An FPGA processing chain for a hyperspectral imaging satellite, written in
+vendor-neutral SystemVerilog. It started as a Sobel edge-detection
+accelerator on a Basys 3 board and is now the kind of datapath a
+Pixxel-class pushbroom payload runs between the detector and the downlink:
 
-Progress so far:
-- **Phase 1:** the original Basys 3 design, cleaned up into a parameterised,
-  AXI4-Stream, fully verified core.
-- **Phase 2:** a hyperspectral pushbroom front end (`rtl/hs/`).
-- **Phase 3:** a CCSDS 123.0-B-2 lossless compressor (`rtl/ccsds123/`),
-  byte-exact against an independent reference implementation.
-- **Phase 4:** radiation-tolerance features (`rtl/rel/`): SECDED-protected
-  memories, triplicated control registers and fault-injection tests.
+- **Calibration** of the raw detector stream: dark and gain correction, bad
+  pixel replacement and band selection.
+- **CCSDS 123.0-B-2 lossless compression**, the space agencies' standard for
+  hyperspectral data. It is byte-exact against an independent reference model.
+- **Onboard analytics**: NDVI, a cloud mask, vegetation and edge maps, and a
+  per-frame keep/drop decision, so cloudy frames need not take downlink time.
+- **Radiation tolerance**: SECDED-protected memories, triplicated control
+  registers and fault-injection tests that prove both work.
 
-## Pipeline
+Primary target: **AMD Zynq UltraScale+ ZCU106** (XCZU7EV). The datapath uses
+no vendor IP or primitives, so the same RTL also synthesises for the
+rad-tolerant **XQRKU060** (Kintex UltraScale) and for Versal-class parts.
+Everything is verified in simulation and synthesised with Yosys in CI, with no
+board needed. [What that does and does not prove](#what-is-not-verified-yet)
+is listed at the end.
 
-```
- clk_src (100 MHz)                 clk_proc (200 MHz)
- image_rom_source ─▶ axis_async_fifo ─▶ edge_pipeline ──────────────────────────▶ axis_serializer ─▶ pins
-                     (gray-code CDC)    │ reg ─▶ sobel_core ─▶ reg ─▶ avg_pool2x2 ─▶ reg │
-```
+## At a glance
 
-| Block | What it does |
+| | |
 |---|---|
-| `rtl/edge/image_rom_source.sv` | Plays a `$readmemh` image out as AXI-Stream, `NUM_FRAMES` times or forever |
-| `rtl/common/axis_async_fifo.sv` | Dual-clock FIFO with gray-coded pointers (replaces the FIFO Generator IP) |
-| `rtl/edge/sobel_core.sv` | 3x3 Sobel, `|Gx| + |Gy|` saturated to `2^DW - 1`; outputs `(W-2) x (H-2)` |
-| `rtl/edge/avg_pool2x2.sv` | 2x2 average pooling, `floor(sum / 4)` |
-| `rtl/edge/edge_pipeline.sv` | Sobel + pooling with a register slice at every boundary (the reusable core) |
-| `rtl/edge/axis_serializer.sv` | Pixels to a 1-bit stream, MSB first, with a last-bit marker |
-| `rtl/common/sdp_ram.sv` | Generic RAM; `RAM_STYLE` = `block`, `distributed`, `ultra` or `auto` |
-| `rtl/common/axis_register.sv` | Skid buffer that registers `tready` |
-| `rtl/top/edge_accel_top.sv` | Vendor-neutral top (no clocking IP) |
-| `rtl/board/basys3_top.sv` | Basys 3 wrapper: `clk_wiz_0` plus pins |
+| Interfaces | AXI4-Stream data, one AXI4-Lite register slave, an interrupt per frame |
+| Throughput | 1 sample per clock through calibration, compression and analytics (with 9 or more bands kept) |
+| Compression | CCSDS 123.0-B-2 lossless, D = 2..16 bits, P = 0..15, full or reduced prediction; every image is a complete standard file with its header |
+| Analytics | 8-bit NDVI, cloud and vegetation masks, Sobel edges of the NDVI image, per-frame counts and keep flag |
+| Flight build | `ECC = 1`, `TMR = 1`: every compressor state memory under SECDED, control counters triplicated, upset counters in telemetry |
+| Size (Yosys, UltraScale+) | Whole payload about 7,200 LUTs, 4,800 FFs, 8 DSP48, 5 RAMB18; flight build about 7,800 LUTs, 5,000 FFs |
+| Verification | 67 simulation cases on Icarus and Verilator, 54 model tests, byte-exact cross-check against the NTNU CCSDS 123 model, 27 deliberately injected bugs all caught |
 
-**Interfaces.** Every block uses AXI4-Stream: `tdata`, `tvalid`, `tready`,
-`tuser` = start of frame and `tlast` = end of line. `tuser` re-aligns the
-internal row/column counters, and `framing_err` pulses when an input `tlast`
-does not match the configured line length.
+## Architecture
 
-**Parameters.** `DW` (bits per pixel, tested at 8, 10, 12 and 16), `IMG_W` and
-`IMG_H` (tested from 2x2 up to 128-wide frames). `edge_pipeline` needs even
-`IMG_W` and `IMG_H`, and its output is `(IMG_W-2)/2 x (IMG_H-2)/2`.
+```
+                        ┌──────────────────────────── payload_top ─────────────────────────────┐
+ detector  BIP samples  │ hs_frontend_core                              ┌▶ ccsds123_top ───────┼─▶ m_comp  64-bit, one CCSDS
+ readout ──────────────▶│ line pacing ─▶ dark/gain ─▶ bad pixels ─▶ band ┤   predictor, coder,  │          123 file per frame
+ (NB bands, D bits)     │ (line rate)    correction    replacement   select│   header, packer     │
+                        │                                               └▶ analytics_top ──────┼─▶ m_prod  {cloud, veg, NDVI}
+                        │                                                   NDVI, cloud mask,  ├─▶ m_edge  NDVI edges
+                        │                                                   Sobel, summary     ├─▶ irq_frame + summary regs
+                        │ AXI4-Lite: tables, band mask, thresholds, telemetry counters          │
+                        └──────────────────────────────────────────────────────────────────────┘
+```
 
-**Border policy.** Sobel only produces a result where the full 3x3 window
-lies inside the image (the "valid" convolution mode). There is no row wrap
-and no garbage from uninitialised line buffers.
+In a Zynq system the processing system (PS) loads the calibration tables
+over AXI4-Lite, DMA moves detector lines in and compressed files out, and
+flight software reads each frame's summary on `irq_frame` to decide whether
+to downlink that frame. All blocks share one clock and use AXI4-Stream with
+`tuser` = first sample of a frame and `tlast` = last sample of a line (last
+byte of an image on `m_comp`). Every block handles backpressure and never
+drops a sample.
 
-**Backpressure.** Each processing block stalls as a whole when its output is
-not accepted, and register slices between blocks keep `tready` off the
-critical path. No pixel is ever dropped, from the ROM to the serial pins.
+The stream is band-interleaved-by-pixel (BIP): bands 0..NB-1 of pixel 0, then
+pixel 1, and so on, the order a pushbroom detector reads out.
 
-## Hyperspectral front end (`rtl/hs/`)
+## Blocks
 
-The stream is band-interleaved-by-pixel (BIP), like a pushbroom detector
-readout: band 0..NB-1 of pixel 0, then pixel 1, and so on. Each line holds
-`NX * NB` samples. `tuser` marks the first sample of a frame and `tlast` the
-last sample of a line.
+### Hyperspectral front end (`rtl/hs/`)
 
 ```
 s_axis ─▶ line_pacer ─▶ radiometric_corr ─▶ badpix_replace ─▶ band_select ─▶ m_axis
            line timing   (x - dark) * gain    nearest-left good   keep masked bands
-                    (register slice between every block, AXI4-Lite register map)
 ```
 
 | Block | What it does |
@@ -70,25 +72,15 @@ s_axis ─▶ line_pacer ─▶ radiometric_corr ─▶ badpix_replace ─▶ ba
 | `line_pacer` | Starts at most one line every `LINE_PERIOD` cycles, which emulates the detector's line rate when replaying from DDR. Counts overruns when backpressure makes a line miss its slot |
 | `radiometric_corr` | `clamp(((x - dark[p,b]) * gain[p,b] + 2^(GF-1)) >> GF)`, with per pixel/band tables and one DSP48 |
 | `badpix_replace` | Replaces a flagged sample with the last good sample to its left in the same band (0 if there is none) |
-| `band_select` | Keeps the bands set in `BAND_MASK`, the way Pixxel Firefly keeps ~45 of its ~135 bands. The mask switches only at frame start |
-| `hs_frontend` | Chains the four blocks, with an AXI4-Lite slave (`axil_cfg_bridge`), table loading and telemetry counters |
+| `band_select` | Keeps the bands set in `BAND_MASK`, the way a hyperspectral mission keeps the bands a product needs. The mask switches only at frame start |
+| `hs_frontend_core` | Chains the four blocks with a register slice between each, plus table loading and telemetry counters |
+| `hs_frontend` | `hs_frontend_core` with its own AXI4-Lite slave, for use on its own |
 
-The register map is documented at the top of `rtl/hs/hs_frontend.sv`. It
-covers ID, geometry, line period, band mask, the dark/gain/bad-pixel tables,
-and counters for overruns, framing errors, lines out and replaced samples.
+### CCSDS 123.0-B-2 compressor (`rtl/ccsds123/`)
 
-`model/hs_golden.py` is the bit-exact reference. It also generates a
-synthetic scene with water, vegetation (red edge), soil and cloud spectra,
-plus dark offsets, gain spread, dead columns and saturating samples.
-`tb/tb_hs_frontend.sv` programs the design over AXI4-Lite, streams the cube
-with random stalls, checks every sample, then reads the counters back.
-
-## CCSDS 123.0-B-2 lossless compressor (`rtl/ccsds123/`)
-
-CCSDS 123.0-B-2 is the space agencies' standard for compressing
-multispectral and hyperspectral images onboard. It predicts each sample from
-its spatial neighbours and the previous bands with weights that adapt as the
-image streams through, then entropy-codes the prediction residuals.
+CCSDS 123.0-B-2 predicts each sample from its spatial neighbours and the
+previous bands, with weights that adapt as the image streams through, then
+entropy-codes the prediction residuals.
 
 ```
 s_axis ─▶ predictor ─▶ slice ─▶ entropy coder ─▶ header insert ─▶ packer ─▶ m_axis
@@ -100,76 +92,238 @@ s_axis ─▶ predictor ─▶ slice ─▶ entropy coder ─▶ header insert �
 |---|---|
 | `ccsds123_predictor` | Local sums, local differences, weighted prediction, mod-R scaling, residual mapping and sign-algorithm weight update (sections 4.4 to 4.10 of the standard). Line buffer in block RAM, per-band weights and state in small RAMs |
 | `ccsds123_coder` | Sample-adaptive entropy coder (5.4.3.2): per-band accumulator, shared counter with rescaling, code parameter k, unary/binary codewords and escape codes |
-| `ccsds123_packer` | Packs codewords into a 64-bit AXI4-Stream byte stream (lane 0 first), pads each image to a whole byte, `tkeep` and `tlast` on the last word |
-| `ccsds123_top` | Chains them and, with `EMIT_HEADER = 1`, starts each image with the standard header built from the parameters, so every image is a complete file any compliant decoder reads |
+| `ccsds123_packer` | Packs codewords into a 64-bit byte stream (lane 0 first), pads each image to a whole byte, `tkeep` and `tlast` on the last word |
+| `ccsds123_top` | Chains them and, with `EMIT_HEADER = 1`, starts each image with the standard header built from the parameters |
 
-**Configuration.** Lossless, unsigned samples, D = 2..16 bits, full or
-reduced prediction, P = 0..15 previous bands, wide neighbour- or
-column-oriented local sums, all weight and coder parameters of the standard,
-band-interleaved-by-pixel order (as a pushbroom sensor reads out), output
-word size 1 byte. The parameters are fixed at build time and recorded in the
-header.
+Lossless, unsigned samples, D = 2..16 bits, P = 0..15 previous bands, full or
+reduced prediction, neighbour- or column-oriented local sums, all weight and
+coder parameters of the standard, BIP order, 1-byte output words. The
+parameters are fixed at build time and recorded in the header. One sample per
+clock when 9 or more bands are kept: the per-band weight update has `NZ`
+clocks to finish, and with fewer bands the input stalls until it has.
 
-**Throughput.** One sample per clock when the image has 9 or more bands. The
-per-band weight update has `NZ` clocks to finish because the same band only
-comes back one pixel later; with fewer bands the input stalls until it has.
+### Onboard analytics (`rtl/analytics/`)
 
-**Reference model.** `model/ccsds123.py` is a compressor and decompressor
-written from the standard. `make ntnu-check` clones the independent
-[NTNU SmallSat Lab model](https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model)
-(verified by its authors against the official CCSDS test vectors) at a pinned
-commit and compares the complete compressed files of both models on 11
-configurations. All 11 are identical byte for byte. The chain is
-RTL = `ccsds123.py` = NTNU model.
+From the calibrated stream, per pixel:
 
-**Resources** (Yosys, default build: 64 x 64 pixels, 16 bands, D = 16, P = 3,
-full prediction): about 6,500 LUTs, 3,100 flip-flops, 7 DSP48 and one
-RAMB18 on UltraScale+, under 3% of the ZCU106's XCZU7EV.
+```
+ndvi8 = floor(256 * NIR / (NIR + RED)), saturated to 255; 128 if both are 0
+cloud = BLUE >= bright  and  |ndvi8 - 128| <= white      (bright and spectrally flat)
+veg   = not cloud and ndvi8 >= veg
+```
 
-## Reliability for space (`rtl/rel/`)
+`ndvi8` is NDVI = (NIR - RED) / (NIR + RED) mapped from [-1, 1] to [0, 255],
+computed with one 9-stage pipelined divider (`ndvi_div`) and no sign
+handling. The NDVI image also runs through the original Sobel core, so field
+boundaries and coastlines show up as edges.
+
+| Output | Content |
+|---|---|
+| `m_prod` | One 16-bit word per pixel: `{cloud, veg, 000000, ndvi8}` |
+| `m_edge` | Sobel magnitude of the NDVI image, `(NX-2) x (NY-2)` |
+| Summary, `sum_valid` | Cloud, vegetation and edge pixel counts, and `keep = cloud * 256 <= cloud_max * NX * NY` |
+
+The band indices and thresholds can change between frames: each frame is
+classified with the configuration that was present at its first sample, even
+while the previous frame is still in the pipeline.
+
+### Payload top (`rtl/payload/`)
+
+`payload_top` forks the calibrated stream into the compressor and the
+analytics (a sample leaves only when both take it) and puts everything behind
+one AXI4-Lite slave. Byte addresses `0x0000_0000` to `0x0FFF_FFFF` are the
+front end (map at the top of `rtl/hs/hs_frontend.sv`: ID, line period, band
+mask, dark/gain/bad-pixel tables, counters). The payload registers start at
+`0x1000_0000`:
+
+| Offset | Register | Access | Content |
+|---|---|---|---|
+| 0x00 | ID | RO | `0x504C_0005` |
+| 0x04 | GEOMETRY | RO | `{NZ[15:0], NX[15:0]}` |
+| 0x08 | LINES | RO | NY |
+| 0x0C | CTRL | WO | bit 0: clear the counters below |
+| 0x10 | AN_BANDS | RW | `{blue[23:16], nir[15:8], red[7:0]}`, indices among the kept bands |
+| 0x14 | AN_BRIGHT | RW | cloud brightness threshold on the blue band (D bits) |
+| 0x18 | AN_THRESH | RW | `{edge[23:16], veg[15:8], white[7:0]}` |
+| 0x1C | AN_CLOUD_MAX | RW | keep a frame if its cloud fraction is at most value / 256 (0..256) |
+| 0x20 to 0x2C | LAST_CLOUD, LAST_VEG, LAST_EDGE, LAST_KEEP | RO | summary of the last frame |
+| 0x30, 0x34 | FRAMES_ANALYSED, FRAMES_KEPT | RO | frame counters |
+| 0x38, 0x3C | IMAGES_COMPRESSED, BYTES_COMPRESSED | RO | compressor output counters |
+| 0x40, 0x44 | ECC_CORRECTED, ECC_UNCORRECTABLE | RO | memory upsets (flight build) |
+| 0x48 | TMR_UPSETS | RO | outvoted register upsets (flight build) |
+| 0x4C | FRAMING_ERRS | RO | malformed frames seen by the compressor or the analytics |
+
+### Reliability for space (`rtl/rel/`)
 
 In orbit, heavy ions and protons flip bits (single-event upsets, SEUs) in
-flip-flops, block RAM and the FPGA's configuration memory. The compressor
-has a flight build (`ECC = 1`, `TMR = 1` on `ccsds123_top`) that protects
-its own state:
+flip-flops, block RAM and the FPGA's configuration memory. With `ECC = 1` and
+`TMR = 1` (on `ccsds123_top` or `payload_top`) the compressor protects its
+own state:
 
 | Block | What it does |
 |---|---|
-| `secded_enc` / `secded_dec` | Extended Hamming SECDED code for any data width: corrects any single-bit error, detects any double-bit error. 64 data bits give the classic (72,64) code |
-| `ecc_sdp_ram` / `ecc_lb_ram_rf` | Drop-in replacements for the RAMs, with SECDED per slice (per weight, for the predictor weights), error flags and an error-injection input |
+| `secded_enc` / `secded_dec` | Extended Hamming SECDED code for any data width: corrects any single-bit error and detects any double-bit error. 64 data bits give the classic (72,64) code |
+| `ecc_sdp_ram` / `ecc_lb_ram_rf` | Drop-in replacements for the RAMs, with SECDED per slice (per weight for the predictor weights), error flags and an error-injection input |
 | `tmr_reg` | Triplicated register with a majority voter that re-converges every clock, so an upset never reaches the output; reports outvoted upsets |
 
-In the flight build every state memory of the compressor (line buffer, band
-state, weights, accumulators) is ECC-protected and the position counters and
-the coder's counter are triplicated. These memories are rewritten every
-pixel or line, so a corrected upset is also flushed out and they need no
-background scrubber. `ccsds123_top` counts corrected and uncorrectable memory
-errors and outvoted register upsets for telemetry.
+Every state memory of the compressor (line buffer, band state, weights,
+accumulators) is ECC-protected, and the position counters and the coder's
+counter are triplicated. These memories are rewritten every pixel or line,
+so a corrected upset is also flushed out and they need no background
+scrubber. The upset counters go to telemetry. The flight synthesis also bans
+SRL primitives, whose contents configuration scrubbing cannot correct.
 
-The protection is cheap: on UltraScale (Yosys, default image size) the
-flight build is about 7,300 LUTs, 3,300 flip-flops, 7 DSP48 and one RAMB36,
-against 6,450 LUTs, 3,100 flip-flops and one RAMB18 without it.
+### Edge-detection core (`rtl/edge/`, `rtl/top/`)
 
-Fault-injection tests (`tb/tb_ccsds123.sv`, `FAULT` parameter) inject upsets
-into live state while images stream through:
+The original project, cleaned up into a parameterised AXI4-Stream core:
+`sobel_core` (3x3 Sobel, `|Gx| + |Gy|` saturated, valid region only),
+`avg_pool2x2`, `edge_pipeline`, a dual-clock `axis_async_fifo` that replaces
+the vendor FIFO IP, and `edge_accel_top` / `basys3_top` for the board demo.
+`sobel_core` is reused by the analytics.
+
+## Verification
+
+Everything runs without a board, in CI on every push:
+
+```
+make test            # model tests, NTNU cross-check, Verilator lint, Icarus regression, Yosys synthesis
+make sim-verilator   # the same regression compiled with Verilator
+make synth           # Yosys synthesis only
+python3 scripts/regress.py -k payload     # run the cases whose name contains "payload"
+```
+
+Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), `git`, and
+Python 3 with `numpy`, `pytest`, `bitarray` and `psutil`.
+
+**Golden models.** Every block has a bit-exact Python model in `model/`:
+`edge_golden.py`, `hs_golden.py`, `ccsds123.py` (compressor and decompressor
+written from the standard), `analytics_golden.py` and `payload_golden.py`,
+which chains them exactly as the hardware does. 54 pytest tests check the
+models themselves, for example the compressor round trip, NDVI against
+floating-point NDVI, and the Sobel model against a direct convolution.
+
+**Testbenches.** Every testbench is self-checking: it streams data with
+random `tvalid` gaps and random `tready` stalls, compares every output beat
+(data, `tuser`, `tlast`, `tkeep`) with the model, and checks that outputs hold
+steady while stalled.
+
+| Area | Cases | What they cover |
+|---|---|---|
+| Edge core | 15 | 8 to 16-bit pixels, 2x2 to 128-wide frames, odd sizes, the full design across two unrelated clocks |
+| Front end | 7 | Calibration, bad pixels, band masks, AXI4-Lite programming, line pacing and overruns |
+| CCSDS 123 | 13 | D = 2 to 16, P = 0 to 15, full and reduced prediction, both local sums, NX = 1, NZ = 1 and 3 (hazard stalls), mod-R wrap, weight clipping, escape codes, counter rescaling, images back to back |
+| Reliability | 6 + 9 | Fault injection (below); SECDED on every single and double-bit error for 9 widths from 1 to 64 bits |
+| Analytics | 12 | Synthetic scenes and random data, 3x3 frames back to back, a new band choice and thresholds every frame, keep decision exactly on its boundary |
+| Payload | 5 | The whole chain programmed over AXI4-Lite, compressed bytes, products, edges and every register checked; flight build; heavy backpressure from the analytics outputs |
+
+**Independent CCSDS reference.** `make ntnu-check` clones the
+[NTNU SmallSat Lab model](https://github.com/NTNU-SmallSat-Lab/ccsds123_issue_2_verification_model)
+at a pinned commit (its authors verified it against the official CCSDS test
+vectors) and compares complete compressed files on 11 configurations. All 11
+are identical byte for byte, so the chain is RTL = `ccsds123.py` = NTNU model.
+
+**Fault injection** (`FAULT` parameter of `tb/tb_ccsds123.sv`), with images
+streaming through:
 
 | Test | Result |
 |---|---|
-| Single-bit memory upsets, flight build | Output byte-exact; every upset counted as corrected |
+| Single-bit upsets in every state memory, flight build | Output byte-exact; every upset counted as corrected |
 | Upsets in one copy of every TMR register | Output byte-exact; upsets counted as outvoted |
 | The same memory upsets without ECC (control) | Output corrupted, which shows the injection hits state that matters |
 | Double-bit memory upsets | Detected and counted as uncorrectable |
 
-What this does not cover, and a flight design still needs:
-- **Configuration memory scrubbing.** On AMD parts this is the Soft Error
-  Mitigation (SEM) IP, or the XQRKU060's and Versal's built-in scrubbing. It
-  is vendor IP configured in Vivado, so it is not in this repo.
-- **Full TMR of the datapath.** Only the control state is triplicated here.
-  Flight teams usually triplicate the whole netlist with a TMR tool, or rely
-  on per-image error detection, as this design does through its error
-  counters.
-- **DDR ECC and single-event latch-up protection.** These are board and
-  processing-system level.
+**Bug injection.** To check that the tests would notice real mistakes, small
+bugs were put into the RTL one at a time (off-by-one comparisons, a wrong
+band selected at a frame boundary, a lost backpressure term, thresholds taken
+from the wrong frame, and so on). All 13 in the compressor and all 14 in the
+analytics and payload made the regression fail.
+
+**Synthesis.** `scripts/yosys/synth_check.sh` synthesises every top for the
+7-series, UltraScale and UltraScale+ cell libraries and fails on latches,
+netlist check errors or any SRL. That shows the RTL is synthesisable and maps
+to block RAM and DSPs as intended. It is not Vivado timing closure.
+
+## Resources
+
+Yosys `synth_xilinx`, UltraScale+ cells, default parameters of each top:
+
+| Design | LUTs | Flip-flops | DSP48 | Block RAM |
+|---|---|---|---|---|
+| `edge_accel_top` (64x64, 8-bit, Basys 3 demo) | 308 | 426 | 0 | 1 RAMB36, 1 RAMB18 (+2 LUTRAM cells) |
+| `hs_frontend` (64 pixels, 16 bands, 16-bit) | 675 | 826 | 1 | 3 RAMB18 (+2 LUTRAM cells) |
+| `ccsds123_top` (64x64, 16 bands, D = 16, P = 3) | 6,450 | 3,079 | 7 | 1 RAMB18 (+12 LUTRAM cells) |
+| `ccsds123_top`, flight build | 7,269 | 3,304 | 7 | 1 RAMB36 (+16 LUTRAM cells) |
+| `analytics_top` (32x24, 16 bands) | 795 | 997 | 1 | 1 RAMB18 |
+| `payload_top` (32x16, 32 bands in, 16 kept, D = 12) | 7,151 | 4,815 | 8 | 5 RAMB18 (+12 LUTRAM cells) |
+| `payload_top`, flight build | 7,803 | 5,031 | 8 | 5 RAMB18 (+16 LUTRAM cells) |
+
+The XCZU7EV on the ZCU106 has 230k LUTs, 461k flip-flops, 1,728 DSPs and
+312 RAMB36, and the XQRKU060 has 331k LUTs, 2,760 DSPs and 1,080 RAMB36, so
+the whole flight payload uses a few percent of either. That leaves room for
+several compressors in parallel (by strips of the image) to reach the line
+rates of a wide-swath sensor. Yosys counts are an estimate; Vivado usually
+packs LUTs tighter.
+
+## Targets
+
+| Part | Role | Status |
+|---|---|---|
+| ZCU106 (XCZU7EV, Zynq UltraScale+) | Primary development target: PS for control and DMA, PL for this datapath | RTL synthesises for UltraScale+ (Yosys); Vivado script ready |
+| XQRKU060 (Kintex UltraScale, rad-tolerant) | Flight part | RTL synthesises for UltraScale (Yosys); Vivado script uses the commercial XCKU060 as a stand-in (same die) |
+| Versal XQR | Next-generation flight part | Same vendor-neutral RTL; not synthesised yet |
+| Basys 3 (Artix-7) | Original edge-detection demo | Board wrapper and constraints kept |
+
+Vivado scripts (`scripts/vivado/`, not yet run):
+
+```
+vivado -mode batch -source scripts/vivado/synth_ooc.tcl -tclargs zcu106 payload   # payload on XCZU7EV, 250 MHz
+vivado -mode batch -source scripts/vivado/synth_ooc.tcl -tclargs ku060 flight     # flight build on XCKU060, 200 MHz
+vivado -mode batch -source scripts/vivado/build_basys3.tcl                        # Basys 3 edge demo bitstream
+```
+
+## What is not verified yet
+
+Neither a board nor Vivado was available while building this, so these are
+open:
+
+| Item | Status |
+|---|---|
+| Timing closure | **Not run.** No Vivado timing or utilisation reports exist for the new design; the `Report/` PNGs are from the original Basys 3 design. The pipelines were written for 200 to 250 MHz, but that is unproven |
+| Vivado scripts, Basys 3 wrapper and constraints | Written, never run |
+| Official CCSDS test vectors | Not run directly. Conformance rests on the byte-exact match with the NTNU model, which its authors checked against them |
+| Configuration memory scrubbing | Not in this repo: it is the SEM IP on UltraScale, or built-in scrubbing on XQRKU060 and Versal, configured in Vivado |
+| Full datapath TMR, DDR ECC, latch-up protection | Only control state is triplicated here; the rest is a TMR tool's, the board's or the PS's job |
+| Radiation testing | None. Fault injection in simulation shows the protection logic works; it says nothing about real upset rates |
+| PS software, DMA and ground segment | Not written: no driver, no CCSDS Space Packet framing, no downlink |
+| Real sensor data | Tested with synthetic scenes (water, crops, soil and cloud spectra with noise, dark offsets, gain spread and dead pixels), not with real imagery |
+
+## Repository layout
+
+```
+rtl/common/     AXI4-Stream register, async FIFO, RAMs, AXI4-Lite bridge, reset sync
+rtl/edge/       Sobel, pooling, serializer, image ROM (the original project)
+rtl/hs/         hyperspectral front end
+rtl/ccsds123/   CCSDS 123.0-B-2 compressor
+rtl/rel/        SECDED, ECC memories, TMR
+rtl/analytics/  NDVI divider and analytics
+rtl/payload/    payload_top
+rtl/top/, rtl/board/, constraints/   edge demo top and Basys 3 wrapper
+model/          bit-exact Python models and their tests
+tb/             self-checking testbenches
+scripts/        regression runner, NTNU cross-check, Yosys and Vivado scripts
+```
+
+## Roadmap
+
+1. **Done:** streaming edge core with golden model and CI.
+2. **Done:** hyperspectral front end.
+3. **Done:** CCSDS 123.0-B-2 lossless compressor, byte-exact against an independent reference.
+4. **Done:** SECDED memories, TMR and fault-injection tests.
+5. **Done:** onboard analytics and the integrated payload top.
+6. Vivado timing and utilisation on ZCU106 and XCKU060 (needs Vivado, not a board: `synth_ooc.tcl` is ready).
+7. PS integration on the ZCU106: DMA, a Linux or bare-metal driver, CCSDS Space Packets over Ethernet to a PC ground station.
+8. Strip-parallel compressors for wide-swath line rates, and near-lossless mode (CCSDS 123.0-B-2 quantisation).
+9. SEM scrubbing and a full TMR flow for the flight part.
 
 ## Fixes against the original design
 
@@ -184,90 +338,7 @@ What this does not cover, and a flight design still needs:
 | Vendor FIFO Generator IP in the datapath | Portable `axis_async_fifo` |
 | Testbenches had to be checked by eye in the waveform | Self-checking testbenches against a Python golden model, in CI |
 
-## Verification (no board needed)
-
-All verification is board-free and runs in CI on every push:
-
-```
-make test            # model tests + NTNU cross-check + Verilator lint + Icarus regression + Yosys synthesis
-make sim-verilator   # the same regression compiled with Verilator
-make synth           # Yosys synthesis only
-```
-
-Needs `iverilog` (12+), `verilator` (5.x), `yosys` (0.33+), `git`, Python 3 with
-`numpy`, `pytest`, `bitarray` and `psutil` (the last two for the NTNU model).
-
-- `model/edge_golden.py` is the bit-exact reference: what the RTL must
-  produce. `model/test_edge_golden.py` checks it against a direct
-  per-pixel convolution.
-- `tb/tb_axis_stage.sv` tests `sobel_core`, `avg_pool2x2` and `edge_pipeline`.
-  It drives random `tvalid` gaps and random `tready` stalls, compares every
-  output beat (data, `tuser`, `tlast`) with the golden model, and checks the
-  AXI-Stream rule that the output holds steady while stalled.
-- `tb/tb_edge_accel_top.sv` runs the whole design across two unrelated
-  clocks (including a source faster than the processing clock), de-serializes
-  the output pins and checks every pixel.
-- `tb/tb_hs_frontend.sv` covers the hyperspectral front end, including
-  AXI4-Lite programming, line pacing and overrun detection.
-- `tb/tb_ccsds123.sv` streams images through `ccsds123_top` with random
-  stalls and checks every mapped residual leaving the predictor, every output
-  byte against `model/ccsds123.py`, `tkeep`, `tlast` and stability under
-  backpressure. The 13 cases cover D = 2, 8, 10, 12, 14 and 16, P = 0 to 15,
-  full and reduced prediction, both local sums, Nx = 1, Nz = 1 and 3 (hazard
-  stalls), R = 32 with mod-R wrap-around, weight clipping, escape codes,
-  counter rescaling, several images back to back and header on or off.
-  Deliberately injected bugs (13 different ones) all make the regression fail.
-- `tb/tb_secded.sv` checks the SECDED code on every single-bit and
-  double-bit error pattern for nine data widths from 1 to 64 bits. The
-  fault-injection cases (`rel_seu_*`) are described under Reliability.
-- `make ntnu-check` compares `model/ccsds123.py` with the NTNU reference model
-  (needs `bitarray` and `psutil`).
-- `scripts/regress.py` lists the cases: 8/10/12/16-bit, minimum sizes,
-  odd sizes, full rate and heavy stalls. CI (`.github/workflows/ci.yml`) runs
-  everything on every push.
-- `scripts/yosys/synth_check.sh` synthesises `edge_accel_top`, `hs_frontend`,
-  `ccsds123_top` and its flight build (ECC and TMR on) with Yosys
-  for the 7-series, UltraScale and UltraScale+ cell libraries. It fails on
-  latches, netlist check errors or any SRL (the flight build bans SRLs),
-  and prints the cell counts. That proves the RTL is synthesisable and maps
-  to block RAM as intended, but it is not Vivado timing closure.
-
-## Building with Vivado
-
-```
-vivado -mode batch -source scripts/vivado/build_basys3.tcl            # Basys 3 bitstream + reports
-vivado -mode batch -source scripts/vivado/synth_ooc.tcl -tclargs zcu106   # core on XCZU7EV, 250 MHz
-vivado -mode batch -source scripts/vivado/synth_ooc.tcl -tclargs ku060    # core on XCKU060, 200 MHz
-```
-
-The `ku060` run uses the commercial XCKU060 as a stand-in for the XQRKU060
-flight part (same Kintex UltraScale die). Reports go to `vivado_out/`.
-
 `Basys3.xpr.zip` and `ip/async_fifo/` are the original Vivado 2018.2 project
-and IP. They are kept for reference only; the scripts above replace them.
-
-**Basys 3 pins:** BTNC = reset, SW0 = downstream ready, Pmod JA1/JA2/JA3 =
-serial data/valid/last bit, LD0 = valid, LD14 = framing error, LD15 = source done.
-
-## Status of hardware results
-
-| Item | Status |
-|---|---|
-| RTL behaviour | Verified in simulation against the golden model (Icarus and Verilator) |
-| Synthesisability | Checked with Yosys for 7-series, UltraScale and UltraScale+ |
-| CCSDS 123 conformance | Byte-exact with the NTNU reference model on 11 configurations; not run against the official CCSDS test vectors themselves |
-| Vivado timing, utilisation, CDC | **Not run.** The `Report/` PNGs are from the original design |
-| `constraints/basys3.xdc`, `rtl/board/basys3_top.sv`, `scripts/vivado/*.tcl` | **Unverified scaffolding**, never run through Vivado or on a board |
-
-Yosys cell counts for the whole demo (64x64, 8-bit) are about 340 LUTs,
-430 flip-flops, one RAMB36 (image ROM), one RAMB18 (Sobel line buffers) and
-a few LUTRAMs (FIFO and pooling buffers).
-
-## Roadmap
-
-1. **Done:** production-grade streaming core, golden model, CI.
-2. **Done:** hyperspectral front end: line pacing, dark/gain correction, bad pixels, band selection.
-3. **Done:** CCSDS 123.0-B-2 lossless compressor, byte-exact against an independent reference.
-4. PS/PL integration: CCSDS Space Packets over Ethernet to a PC ground station.
-5. Strip-parallel compressors at Pixxel-like line rates.
-6. **Done (in the RTL):** a space-grade build with TMR, memory ECC and fault-injection tests. Still to do: SEM scrubbing and XQRKU060 reports in Vivado.
+and IP, kept for reference only. Basys 3 pins: BTNC = reset, SW0 = downstream
+ready, Pmod JA1/JA2/JA3 = serial data/valid/last bit, LD0 = valid,
+LD14 = framing error, LD15 = source done.
