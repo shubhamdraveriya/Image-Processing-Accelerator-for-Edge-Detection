@@ -183,10 +183,22 @@ module ccsds123_top #(
         end
     end
 
+    // register slice: splits the codeword logic from the packer's barrel
+    // shift (the critical path at 250 MHz without it)
+    logic [CW-1:0] q_code;
+    logic [LW-1:0] q_len;
+    logic          q_last, q_valid, q_ready;
+
+    axis_register #(.W(CW + LW + 1)) u_cw_slice (
+        .clk, .rst,
+        .s_data({k_code, k_len, k_last}), .s_valid(c_valid), .s_ready(k_ready),
+        .m_data({q_code, q_len, q_last}), .m_valid(q_valid), .m_ready(q_ready)
+    );
+
     // ------------------------------------------------------------- packer
     ccsds123_packer #(.CW(CW), .LW(LW)) u_pack (
         .clk, .rst,
-        .s_code(k_code), .s_len(k_len), .s_last(k_last), .s_valid(c_valid), .s_ready(k_ready),
+        .s_code(q_code), .s_len(q_len), .s_last(q_last), .s_valid(q_valid), .s_ready(q_ready),
         .m_axis_tdata, .m_axis_tkeep, .m_axis_tlast, .m_axis_tvalid, .m_axis_tready
     );
 endmodule

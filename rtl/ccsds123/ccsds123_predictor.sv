@@ -15,11 +15,14 @@
 //
 // Throughput is one sample per clock. BIP order makes this possible: a band's
 // weights are next needed NZ samples later, so the weight update has NZ clocks
-// to complete. If NZ < 9 the input stalls until the previous sample of the
-// same band has written its weights back.
+// to complete. If NZ < 9 (NZ < 10 with ECC = 1) the input stalls until the
+// previous sample of the same band has written its weights back.
 //
 // Pipeline (all stages advance together on ce = !m_valid || m_ready):
 //   A  accept; line buffer read (N, NE), band state read (W, NW)
+//   P0 ECC = 1 only: SECDED decode of the memory reads, registered, so the
+//      decoder is not in series with the local sums or the multipliers;
+//      the weight read is issued here instead of in P1
 //   P1 local sum, central and directional local differences
 //   P2 weight read data; local difference vector U
 //   P3 products W_i * U_i      P4 partial sums      P5 predicted central diff
@@ -186,13 +189,17 @@ module ccsds123_predictor #(
     // ----------------------------------------------------- stage registers
     (* shreg_extract = "no" *) logic           v1, v2, v3, v4, v5, v6, v7, v8, v9;
     (* shreg_extract = "no" *) logic [ZW-1:0]  z1, z2, z3, z4, z5, z6, z7, z8, z9;
+    logic          v0;              // P0 (ECC = 1 only; 0 otherwise)
+    logic [ZW-1:0] z0;
 
-    // Hazard: the incoming band must not be in P1..P8. Its band state is
+    // Hazard: the incoming band must not be in P0..P8. Its band state is
     // written from P1, and its weights are written as it leaves P9 and read
-    // in P1, so a sample in P9 has already written them by the time a new
-    // sample of the same band reaches P1.
+    // in P1 (P0 with ECC = 1), one clock after it was accepted, so a sample in
+    // P9 has already written them by the time a new sample of the same band
+    // issues its weight read.
     always_comb begin
         hazard = 1'b0;
+        if (v0 && z0 == cur_z) hazard = 1'b1;
         if (v1 && z1 == cur_z) hazard = 1'b1;
         if (v2 && z2 == cur_z) hazard = 1'b1;
         if (v3 && z3 == cur_z) hazard = 1'b1;
@@ -207,7 +214,7 @@ module ccsds123_predictor #(
         if (rst) begin
             {v1, v2, v3, v4, v5, v6, v7, v8, v9} <= '0;
         end else if (ce) begin
-            v1 <= accept; v2 <= v1; v3 <= v2; v4 <= v3; v5 <= v4;
+            v1 <= v_p; v2 <= v1; v3 <= v2; v4 <= v3; v5 <= v4;
             v6 <= v5; v7 <= v6; v8 <= v7; v9 <= v8;
         end
     end
@@ -220,19 +227,36 @@ module ccsds123_predictor #(
     logic [D-1:0]   n_q, ne_q;
     logic [2*D-1:0] bs_q;            // {W, NW} of this band at the previous pixel
 
-    always_ff @(posedge clk) begin
-        if (ce) begin
-            s1    <= s_axis_tdata;
-            sp1   <= s_prev;
-            z1    <= cur_z;
-            x0_1  <= (cur_x == '0);
-            xl_1  <= cur_xl;
-            y0_1  <= (cur_y == '0);
-            t0_1  <= (cur_t == '0);
-            t1_1  <= (cur_t == TW'(1));
-            last1 <= cur_last;
-            rho1  <= rho_of(cur_t);
+    // per-sample fields set at accept: {s, s_prev, z, x0, xl, y0, t0, t1, last, rho}
+    localparam int SBW = 2 * D + ZW + 6 + 8;
+    logic [SBW-1:0] side_a, side_p;  // at accept / entering P1
+    logic           v_p;             // valid entering P1
+    assign side_a = {s_axis_tdata, s_prev, cur_z, cur_x == '0, cur_xl, cur_y == '0,
+                     cur_t == '0, cur_t == TW'(1), cur_last, rho_of(cur_t)};
+
+    generate
+        if (ECC) begin : g_p0
+            (* shreg_extract = "no" *) logic [SBW-1:0] side0;
+            (* shreg_extract = "no" *) logic           v0_q;
+            always_ff @(posedge clk) begin
+                if (rst)     v0_q <= 1'b0;
+                else if (ce) v0_q <= accept;
+            end
+            always_ff @(posedge clk) if (ce) side0 <= side_a;
+            assign v0     = v0_q;
+            assign z0     = side0[SBW-2*D-1 -: ZW];
+            assign v_p    = v0_q;
+            assign side_p = side0;
+        end else begin : g_no_p0
+            assign v0     = 1'b0;
+            assign z0     = '0;
+            assign v_p    = accept;
+            assign side_p = side_a;
         end
+    endgenerate
+
+    always_ff @(posedge clk) begin
+        if (ce) {s1, sp1, z1, x0_1, xl_1, y0_1, t0_1, t1_1, last1, rho1} <= side_p;
         if (accept) s_prev <= s_axis_tdata;
     end
 
@@ -242,20 +266,39 @@ module ccsds123_predictor #(
     assign ne_addr = cur_xl ? '0 : LIW'(cur_li + LIW'(NZ));
 
     logic lb_sbe, lb_dbe, bs_sbe, bs_dbe, wt_sbe, wt_dbe;
+    logic [D-1:0]   n_m, ne_m;       // memory outputs (decoded)
+    logic [2*D-1:0] bs_m;
+    logic           lb_sbe_m, lb_dbe_m, bs_sbe_m, bs_dbe_m;
 
     ecc_lb_ram_rf #(.DW(D), .DEPTH(NX * NZ), .RAM_STYLE(LB_RAM_STYLE), .ECC(ECC)) u_lb (
         .clk,
-        .a_en (ce), .a_we (accept), .a_addr (cur_li), .a_wdata (s_axis_tdata), .a_rdata (n_q),
-        .b_en (ce), .b_addr (ne_addr), .b_rdata (ne_q),
-        .inj_sbe (inj_sbe && accept), .inj_dbe (inj_dbe && accept), .sbe (lb_sbe), .dbe (lb_dbe)
+        .a_en (ce), .a_we (accept), .a_addr (cur_li), .a_wdata (s_axis_tdata), .a_rdata (n_m),
+        .b_en (ce), .b_addr (ne_addr), .b_rdata (ne_m),
+        .inj_sbe (inj_sbe && accept), .inj_dbe (inj_dbe && accept), .sbe (lb_sbe_m), .dbe (lb_dbe_m)
     );
 
     // band state: {s, N} of this pixel become {W, NW} of the next one
     ecc_sdp_ram #(.DW(2 * D), .DEPTH(NZ), .RAM_STYLE("auto"), .ECC(ECC)) u_bs (
         .clk, .we (ce && v1), .waddr (z1), .wdata ({s1, n_q}),
         .inj_sbe (inj_sbe && ce && v1), .inj_dbe (inj_dbe && ce && v1),
-        .re (ce), .raddr (cur_z), .rdata (bs_q), .sbe (bs_sbe), .dbe (bs_dbe)
+        .re (ce), .raddr (cur_z), .rdata (bs_m), .sbe (bs_sbe_m), .dbe (bs_dbe_m)
     );
+
+    // P0 -> P1: with ECC = 1 the decoded reads are registered
+    generate
+        if (ECC) begin : g_rd_reg
+            always_ff @(posedge clk) begin
+                if (ce) begin
+                    n_q <= n_m; ne_q <= ne_m; bs_q <= bs_m;
+                    lb_sbe <= lb_sbe_m; lb_dbe <= lb_dbe_m; bs_sbe <= bs_sbe_m; bs_dbe <= bs_dbe_m;
+                end
+            end
+        end else begin : g_rd_comb
+            assign n_q = n_m; assign ne_q = ne_m; assign bs_q = bs_m;
+            assign lb_sbe = lb_sbe_m; assign lb_dbe = lb_dbe_m;
+            assign bs_sbe = bs_sbe_m; assign bs_dbe = bs_dbe_m;
+        end
+    endgenerate
 
     // ---------------------------------------------------------- P1 -> P2
     logic [D-1:0] w_q, nw_q;
@@ -303,15 +346,26 @@ module ccsds123_predictor #(
     end
 
     // weight memory (one word = all CZ weights of a band)
-    logic [CZE*WW-1:0] w_rdata, w_wdata;
-    logic              w_we;
+    logic [CZE*WW-1:0] w_rdata, w_wdata, w_m;
+    logic              w_we, wt_sbe_m, wt_dbe_m;
 
-    // one SECDED slice per weight, so each weight can lose a bit independently
+    // one SECDED slice per weight, so each weight can lose a bit independently;
+    // with ECC = 1 the read is issued from P0 and the decoded word registered
     ecc_sdp_ram #(.DW(CZE * WW), .DEPTH(NZ), .RAM_STYLE("auto"), .ECC(ECC), .SLICE(WW)) u_weights (
         .clk, .we (w_we), .waddr (z9), .wdata (w_wdata),
         .inj_sbe (inj_sbe && w_we), .inj_dbe (inj_dbe && w_we),
-        .re (ce), .raddr (z1), .rdata (w_rdata), .sbe (wt_sbe), .dbe (wt_dbe)
+        .re (ce), .raddr (ECC ? z0 : z1), .rdata (w_m), .sbe (wt_sbe_m), .dbe (wt_dbe_m)
     );
+
+    generate
+        if (ECC) begin : g_w_reg
+            always_ff @(posedge clk) begin
+                if (ce) begin w_rdata <= w_m; wt_sbe <= wt_sbe_m; wt_dbe <= wt_dbe_m; end
+            end
+        end else begin : g_w_comb
+            assign w_rdata = w_m; assign wt_sbe = wt_sbe_m; assign wt_dbe = wt_dbe_m;
+        end
+    endgenerate
 
     // count each read once, when the sample that uses it moves on
     assign ecc_sbe = ce && ((v1 && (lb_sbe || bs_sbe)) || (v2 && wt_sbe));

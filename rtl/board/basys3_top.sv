@@ -1,5 +1,5 @@
 `timescale 1ns / 1ps
-// UNVERIFIED SCAFFOLDING: lint-checked only; never built in Vivado or run on a board.
+// Built in Vivado 2018.2 (timing met, bitstream written); not yet run on a board.
 // -----------------------------------------------------------------------------
 // basys3_top: Basys 3 (XC7A35T) wrapper. The only board-specific RTL:
 // it instantiates the clk_wiz_0 IP (100 MHz in -> 100 MHz + 200 MHz out) and
@@ -28,6 +28,11 @@ module basys3_top (
 
     logic framing_err_q;
 
+    // SW0 is asynchronous to clk_200 and fans out to the whole output stage:
+    // bring it in through two flip-flops first
+    (* ASYNC_REG = "TRUE" *) logic [1:0] ready_sync;
+    always_ff @(posedge clk_200) ready_sync <= {ready_sync[0], ready_in};
+
     edge_accel_top #(
         .DW(8), .IMG_W(64), .IMG_H(64), .NUM_FRAMES(0),
         .INIT_FILE("image_stripes_64x64.mem")
@@ -38,7 +43,7 @@ module basys3_top (
         .serial_out   (final_serial_out),
         .serial_valid (final_valid_out),
         .serial_last  (final_bit_last),
-        .serial_ready (ready_in),
+        .serial_ready (ready_sync[1]),
         .framing_err  (framing_err_q),
         .src_done     (led_done)
     );

@@ -16,7 +16,10 @@
 //
 // Pipeline (ce = !m_valid || m_ready):
 //   C0 accept, Gamma update, Sigma RAM read
-//   C1 Sigma select (init / forwarded / RAM), threshold, Sigma write back
+//   R  Sigma RAM read data, SECDED decode, registered
+//   C1 Sigma select (init / forwarded / RAM), threshold, Sigma write back;
+//      the two samples behind see the RAM before this write, so the value
+//      is forwarded to them
 //   C2 k from D-2 parallel compares
 //   C3 codeword
 //
@@ -98,52 +101,73 @@ module ccsds123_coder #(
         .inj ({GW{inj_tmr}}), .mismatch (tmr_err)
     );
 
-    (* shreg_extract = "no" *) logic           v1, v2, v3;
-    (* shreg_extract = "no" *) logic [D-1:0]   d1, d2;
-    (* shreg_extract = "no" *) logic [ZW-1:0]  z1;
+    (* shreg_extract = "no" *) logic           vr, v1, v2, v3;
+    (* shreg_extract = "no" *) logic [D-1:0]   dr, d1, d2;
+    (* shreg_extract = "no" *) logic [ZW-1:0]  zr, z1;
+    (* shreg_extract = "no" *) logic           t0_r, t1_r, last_r, first_r;
     (* shreg_extract = "no" *) logic           t0_1, t1_1, last1, first1, t0_2, last2, first2;
-    (* shreg_extract = "no" *) logic [GW-1:0]  g1;
-    logic [AW-1:0]  acc_rd, acc_wd, fwd_val;
-    (* shreg_extract = "no" *) logic           fwd1;
-    logic           acc_we;
+    (* shreg_extract = "no" *) logic [GW-1:0]  gr, g1;
+    (* shreg_extract = "no" *) logic [AW-1:0]  acc_rd;          // decoded RAM read, in C1
+    (* shreg_extract = "no" *) logic           acc_sbe, acc_dbe;
+    logic [AW-1:0]  acc_m, acc_wd;
+    logic           acc_sbe_m, acc_dbe_m, acc_we;
 
-    logic acc_sbe, acc_dbe;
     ecc_sdp_ram #(.DW(AW), .DEPTH(NZ), .RAM_STYLE("auto"), .ECC(ECC)) u_acc (
         .clk, .we (acc_we), .waddr (z1), .wdata (acc_wd),
         .inj_sbe (inj_sbe && acc_we), .inj_dbe (inj_dbe && acc_we),
-        .re (ce), .raddr (s_z), .rdata (acc_rd), .sbe (acc_sbe), .dbe (acc_dbe)
+        .re (ce), .raddr (s_z), .rdata (acc_m), .sbe (acc_sbe_m), .dbe (acc_dbe_m)
     );
     assign ecc_sbe = ce && v1 && acc_sbe;
     assign ecc_dbe = ce && v1 && acc_dbe;
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0;
+            vr <= 1'b0; v1 <= 1'b0; v2 <= 1'b0; v3 <= 1'b0;
         end else if (ce) begin
-            v1 <= accept; v2 <= v1; v3 <= v2;
+            vr <= accept; v1 <= vr; v2 <= v1; v3 <= v2;
         end
     end
     assign m_valid = v3;
 
+    // Forwarding: the sample in C1 writes Sigma of its band at the end of the
+    // clock. A sample one behind (in R) and one two behind (in C0) have read
+    // the RAM without that write; the nearest one wins.
+    (* shreg_extract = "no" *) logic          fwd_a, fwd_b_r, fwd_b;
+    (* shreg_extract = "no" *) logic [AW-1:0] fwd_a_val, fwd_b_val_r, fwd_b_val;
+
     always_ff @(posedge clk) begin
         if (ce) begin
-            d1     <= s_delta;
-            z1     <= s_z;
-            t0_1   <= s_t0;
-            t1_1   <= s_t1;
-            last1  <= s_last;
-            first1 <= s_t0 && (s_z == '0);
-            g1     <= gamma_nx;
-            // the sample in C1 writes this band now; the RAM read misses it
-            fwd1    <= v1 && !t0_1 && (z1 == s_z);
-            fwd_val <= acc_wd;
+            dr      <= s_delta;
+            zr      <= s_z;
+            t0_r    <= s_t0;
+            t1_r    <= s_t1;
+            last_r  <= s_last;
+            first_r <= s_t0 && (s_z == '0);
+            gr      <= gamma_nx;
+            fwd_b_r     <= v1 && !t0_1 && (z1 == s_z);
+            fwd_b_val_r <= acc_wd;
+
+            acc_rd  <= acc_m;
+            acc_sbe <= acc_sbe_m;
+            acc_dbe <= acc_dbe_m;
+            d1      <= dr;
+            z1      <= zr;
+            t0_1    <= t0_r;
+            t1_1    <= t1_r;
+            last1   <= last_r;
+            first1  <= first_r;
+            g1      <= gr;
+            fwd_a     <= v1 && !t0_1 && (z1 == zr);
+            fwd_a_val <= acc_wd;
+            fwd_b     <= fwd_b_r;
+            fwd_b_val <= fwd_b_val_r;
         end
     end
 
     // ------------------------------------------- C1: Sigma, threshold, update
     logic [AW-1:0] acc_cur;
     logic [AW:0]   acc_sum, thr_c;
-    assign acc_cur = t1_1 ? AW'(SIGMA1) : fwd1 ? fwd_val : acc_rd;
+    assign acc_cur = t1_1 ? AW'(SIGMA1) : fwd_a ? fwd_a_val : fwd_b ? fwd_b_val : acc_rd;
     assign acc_sum = {1'b0, acc_cur} + (AW+1)'(d1);
     assign acc_wd  = (g1 == GW'(GMAX)) ? AW'((acc_sum + 1'b1) >> 1) : AW'(acc_sum);
     assign acc_we  = ce && v1 && !t0_1;

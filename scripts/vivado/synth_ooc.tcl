@@ -1,4 +1,4 @@
-# UNVERIFIED SCAFFOLDING: not yet run (no Vivado available).
+# Run with Vivado 2018.2; results are in the README (Vivado results).
 # Out-of-context synthesis + implementation for a given part, to report
 # utilisation and timing without a board.
 #
@@ -54,3 +54,4 @@ route_design
 
 report_utilization    -file $OUT/utilization.rpt
 report_timing_summary -file $OUT/timing_summary.rpt
+write_checkpoint -force $OUT/routed.dcp

@@ -7,3 +7,5 @@ __pycache__/
 *.jou
 *.log
 vivado_out/
+usage_statistics_webtalk.*
+data/post*
