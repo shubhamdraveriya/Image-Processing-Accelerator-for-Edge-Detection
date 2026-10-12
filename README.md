@@ -26,7 +26,7 @@ is listed at the end.
 | | |
 |---|---|
 | Interfaces | AXI4-Stream data, one AXI4-Lite register slave, an interrupt per frame |
-| Throughput | 1 sample per clock through calibration, compression and analytics (with 9 or more bands kept) |
+| Throughput | 1 sample per clock through calibration, compression and analytics (with 9 or more bands kept, 10 in the flight build) |
 | Compression | CCSDS 123.0-B-2 lossless, D = 2..16 bits, P = 0..15, full or reduced prediction; every image is a complete standard file with its header |
 | Analytics | 8-bit NDVI, cloud and vegetation masks, Sobel edges of the NDVI image, per-frame counts and keep flag |
 | Flight build | `ECC = 1`, `TMR = 1`: every compressor state memory under SECDED, control counters triplicated, upset counters in telemetry |
@@ -83,9 +83,9 @@ previous bands, with weights that adapt as the image streams through, then
 entropy-codes the prediction residuals.
 
 ```
-s_axis ─▶ predictor ─▶ slice ─▶ entropy coder ─▶ header insert ─▶ packer ─▶ m_axis
- D-bit    9 stages,             Sigma/Gamma,      19-byte CCSDS    64-bit words,
- BIP      1 sample/clk          k, codewords      header per image  tkeep, tlast
+s_axis ─▶ predictor ─▶ slice ─▶ entropy coder ─▶ header insert ─▶ slice ─▶ packer ─▶ m_axis
+ D-bit    9 stages,             Sigma/Gamma,      19-byte CCSDS             64-bit words,
+ BIP      1 sample/clk          k, codewords      header per image          tkeep, tlast
 ```
 
 | Block | What it does |
@@ -99,8 +99,10 @@ Lossless, unsigned samples, D = 2..16 bits, P = 0..15 previous bands, full or
 reduced prediction, neighbour- or column-oriented local sums, all weight and
 coder parameters of the standard, BIP order, 1-byte output words. The
 parameters are fixed at build time and recorded in the header. One sample per
-clock when 9 or more bands are kept: the per-band weight update has `NZ`
-clocks to finish, and with fewer bands the input stalls until it has.
+clock when 9 or more bands are kept (10 in the flight build, whose predictor
+has one more stage to register the ECC-decoded memory reads): the per-band
+weight update has `NZ` clocks to finish, and with fewer bands the input
+stalls until it has.
 
 ### Onboard analytics (`rtl/analytics/`)
 
@@ -266,45 +268,42 @@ packs LUTs tighter.
 
 ### Vivado results
 
-`scripts/vivado/synth_ooc.tcl`, Vivado 2018.2, out of context (no I/O
-placement, so the absolute slack is optimistic for the ports but the internal
-paths are real), routed:
+Vivado 2018.2, routed. `synth_ooc.tcl` runs out of context (no I/O placement,
+so slack at the ports is optimistic; the internal paths are real);
+`build_basys3.tcl` is the full board build with pins and the clock IP.
 
-| Design | Part, clock | LUTs | FFs | DSP | Block RAM | WNS | Failing endpoints |
+| Design | Part, clock | LUTs | FFs | DSP | Block RAM | WNS | WHS |
 |---|---|---|---|---|---|---|---|
-| `edge_pipeline` 64x64x8 | XCZU7EV-2, 250 MHz | 192 | 339 | 0 | 1 RAMB18 | met | 0 |
-| `payload_top` | XCZU7EV-2, 250 MHz | 3,726 | 4,309 | 9 | 1 RAMB36 + 6 RAMB18 | +0.158 ns | 0 |
-| `payload_top`, flight build | XCZU7EV-2, 250 MHz | 4,402 | 4,488 | 9 | 2 RAMB36 + 5 RAMB18 | -0.351 ns | 170 |
-| `payload_top`, flight build | XCKU060-2, 200 MHz | 4,396 | 4,488 | 9 | 2 RAMB36 + 5 RAMB18 | -1.052 ns | 571 |
+| `edge_pipeline` 64x64x8 | XCZU7EV-2, 250 MHz | 192 | 339 | 0 | 1 RAMB18 | +2.350 ns | +0.052 ns |
+| `payload_top` | XCZU7EV-2, 250 MHz | 3,736 | 4,423 | 9 | 1 RAMB36 + 6 RAMB18 | +0.261 ns | +0.047 ns |
+| `payload_top`, flight build | XCZU7EV-2, 250 MHz | 4,342 | 4,794 | 9 | 2 RAMB36 + 5 RAMB18 | +0.461 ns | +0.031 ns |
+| `payload_top`, flight build | XCKU060-2, 200 MHz | 4,349 | 4,794 | 9 | 2 RAMB36 + 5 RAMB18 | +0.290 ns | +0.053 ns |
+| `basys3_top` (bitstream) | XC7A35T-1, 100 + 200 MHz | 258 | 420 | 0 | 1.5 tiles | +0.893 ns | +0.036 ns |
 
-These runs predate the coder-to-packer register slice in `ccsds123_top`
-(below); they are the original RTL.
+All timing constraints are met. The Basys 3 build reports 0.20 W on chip and
+a clean `report_cdc` (every crossing safe).
 
-Critical paths found:
+What the first Vivado runs found, and the fixes (all with the full regression
+passing, fault injection included):
 
-- **Coder to packer** (all builds; the worst path of the non-flight payload,
-  13 logic levels): codeword length in the coder's last stage, header mux and
-  the packer's 128-bit shift in one cycle. Fixed by a register slice
-  (`u_cw_slice`) between header insertion and the packer: one cycle of extra
-  latency, byte stream unchanged, full regression passes. Not yet re-run in
-  Vivado.
-- **Predictor RAM read, SECDED decode, then the DSP** (flight build only):
-  the line-buffer RAM output goes through `secded_dec`, the local-sum adders
-  and into a DSP input in one cycle (11 levels on XCKU060), and the weight RAM
-  through `secded_dec` into the weight multiply. These set the flight build's
-  Fmax at about 165 MHz on XCKU060-2. Fixing them needs a predictor stage after
-  the ECC decode (and matching hazard forwarding), which is still open.
+| Path | First run | Fix |
+|---|---|---|
+| Coder codeword logic, header mux and the packer's 128-bit shift in one cycle (13 levels) | Worst path of the payload (+0.158 ns at 250 MHz), failing in the flight build | Register slice `u_cw_slice` between header insertion and the packer: one cycle of latency, byte stream unchanged |
+| Predictor line buffer / band state read, SECDED decode, local sums, DSP input (flight build) | -0.351 ns at 250 MHz on XCZU7EV, -1.052 ns at 200 MHz on XCKU060 (about 165 MHz) | With `ECC = 1` a predictor stage P0 registers the decoded reads; the weight read moves to P0 and the hazard check covers it, so full rate now needs 10 bands instead of 9 |
+| Predictor weight read, SECDED decode, multiply (flight build) | Same | Same P0 stage |
+| Coder accumulator read, SECDED decode, update and write back in one cycle (flight build) | -0.734 ns at 200 MHz on XCKU060 | A read stage R registers the decoded accumulator; the update forwards from the two samples ahead, so one band (`NZ = 1`) still runs at one sample per clock |
+| SW0 (`ready_in`) drove 38 flip-flops in the 200 MHz domain directly (Basys 3) | `report_cdc`: critical, unknown CDC circuitry | Two-flip-flop synchroniser in `basys3_top` |
 
 ## Targets
 
 | Part | Role | Status |
 |---|---|---|
-| ZCU106 (XCZU7EV, Zynq UltraScale+) | Primary development target: PS for control and DMA, PL for this datapath | RTL synthesises for UltraScale+ (Yosys); Vivado script ready |
-| XQRKU060 (Kintex UltraScale, rad-tolerant) | Flight part | RTL synthesises for UltraScale (Yosys); Vivado script uses the commercial XCKU060 as a stand-in (same die) |
+| ZCU106 (XCZU7EV, Zynq UltraScale+) | Primary development target: PS for control and DMA, PL for this datapath | Payload and flight build meet 250 MHz in Vivado (out of context) |
+| XQRKU060 (Kintex UltraScale, rad-tolerant) | Flight part | Flight build meets 200 MHz in Vivado on the commercial XCKU060 (same die), out of context |
 | Versal XQR | Next-generation flight part | Same vendor-neutral RTL; not synthesised yet |
-| Basys 3 (Artix-7) | Original edge-detection demo | Board wrapper and constraints kept |
+| Basys 3 (Artix-7) | Original edge-detection demo | Bitstream builds in Vivado, timing met; not run on a board |
 
-Vivado scripts (`scripts/vivado/`; `synth_ooc.tcl` has been run, see [Vivado results](#vivado-results)):
+Vivado scripts (`scripts/vivado/`, all run with Vivado 2018.2, see [Vivado results](#vivado-results)):
 
 ```
 vivado -mode batch -source scripts/vivado/synth_ooc.tcl -tclargs zcu106 payload   # payload on XCZU7EV, 250 MHz
@@ -319,8 +318,8 @@ open:
 
 | Item | Status |
 |---|---|
-| Timing closure | **Partly.** The payload meets 250 MHz on XCZU7EV; the flight build (ECC + TMR) does not meet 250 MHz on XCZU7EV or 200 MHz on XCKU060 (see [Vivado results](#vivado-results)). The `Report/` PNGs are from the original Basys 3 design |
-| Vivado scripts, Basys 3 wrapper and constraints | `synth_ooc.tcl` runs cleanly in Vivado 2018.2; `build_basys3.tcl`, the wrapper and constraints have not been run yet |
+| Timing closure | **Out of context only.** Payload and flight build meet 250 MHz on XCZU7EV and the flight build 200 MHz on XCKU060 (see [Vivado results](#vivado-results)), but not yet inside a full Zynq design with the PS, DMA and real I/O. The `Report/` PNGs are from the original Basys 3 design |
+| Basys 3 board | Bitstream built with timing met and a clean CDC report; never loaded on a board |
 | Official CCSDS test vectors | Not run directly. Conformance rests on the byte-exact match with the NTNU model, which its authors checked against them |
 | Configuration memory scrubbing | Not in this repo: it is the SEM IP on UltraScale, or built-in scrubbing on XQRKU060 and Versal, configured in Vivado |
 | Full datapath TMR, DDR ECC, latch-up protection | Only control state is triplicated here; the rest is a TMR tool's, the board's or the PS's job |
@@ -351,7 +350,7 @@ scripts/        regression runner, NTNU cross-check, Yosys and Vivado scripts
 3. **Done:** CCSDS 123.0-B-2 lossless compressor, byte-exact against an independent reference.
 4. **Done:** SECDED memories, TMR and fault-injection tests.
 5. **Done:** onboard analytics and the integrated payload top.
-6. **Partly done:** Vivado timing and utilisation on ZCU106 and XCKU060. Open: pipeline the predictor's ECC decode for the flight build, and run the Basys 3 build.
+6. **Done:** Vivado timing and utilisation on ZCU106 and XCKU060 (out of context), and the Basys 3 bitstream.
 7. PS integration on the ZCU106: DMA, a Linux or bare-metal driver, CCSDS Space Packets over Ethernet to a PC ground station.
 8. Strip-parallel compressors for wide-swath line rates, and near-lossless mode (CCSDS 123.0-B-2 quantisation).
 9. SEM scrubbing and a full TMR flow for the flight part.
